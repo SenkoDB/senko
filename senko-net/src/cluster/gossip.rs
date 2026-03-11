@@ -721,12 +721,12 @@ impl GossipState {
 
         if let Some(campaign) = &self.failover
             && campaign.auth_sent
-                && self.can_promote_failover(campaign.failed_primary)
-                && self.failover_vote_count(campaign.failed_primary, &campaign.votes)
-                    >= self.required_failover_votes(campaign.failed_primary)
-            {
-                out.extend(self.promote_local(now_ms, rng));
-            }
+            && self.can_promote_failover(campaign.failed_primary)
+            && self.failover_vote_count(campaign.failed_primary, &campaign.votes)
+                >= self.required_failover_votes(campaign.failed_primary)
+        {
+            out.extend(self.promote_local(now_ms, rng));
+        }
 
         out
     }
@@ -829,9 +829,10 @@ impl GossipState {
 
         for node_id in suspected {
             if selected.insert(node_id)
-                && let Some(node) = self.cluster.get_node(&node_id) {
-                    entries.push(GossipEntry::from_meta(node));
-                }
+                && let Some(node) = self.cluster.get_node(&node_id)
+            {
+                entries.push(GossipEntry::from_meta(node));
+            }
         }
 
         let mut candidates = self
@@ -844,9 +845,10 @@ impl GossipState {
 
         for node_id in candidates.into_iter().take(sample_size) {
             if selected.insert(node_id)
-                && let Some(node) = self.cluster.get_node(&node_id) {
-                    entries.push(GossipEntry::from_meta(node));
-                }
+                && let Some(node) = self.cluster.get_node(&node_id)
+            {
+                entries.push(GossipEntry::from_meta(node));
+            }
         }
 
         entries
@@ -1078,10 +1080,10 @@ impl GossipState {
             let mut mark_pfail = false;
             if let Some(node) = self.cluster.get_node(&node_id)
                 && node.state != NodeState::Failed
-                    && now_ms.saturating_sub(node.pong_recv) > self.node_timeout_ms
-                {
-                    mark_pfail = true;
-                }
+                && now_ms.saturating_sub(node.pong_recv) > self.node_timeout_ms
+            {
+                mark_pfail = true;
+            }
 
             if mark_pfail {
                 if let Some(node) = self.cluster.get_node_mut(&node_id) {
@@ -1161,36 +1163,38 @@ impl GossipState {
         });
         if let Some((failed_primary, requested_epoch, scheduled_at_ms, auth_sent)) =
             failover_snapshot
-            && !auth_sent && now_ms >= scheduled_at_ms {
-                if let Some(campaign) = self.failover.as_mut() {
-                    campaign.auth_sent = true;
-                }
-                if self.total_primary_count() <= 1 {
-                    out.extend(self.promote_local(now_ms, rng));
-                } else {
-                    let local_node_id = self.local_node_id();
-                    let replication_offset = self
-                        .replication
-                        .get(&local_node_id)
-                        .map_or(0, |tracker| tracker.primary_repl_offset);
-                    let slot_bitmap = slots_to_bitmap(&self.local_meta().slots);
-                    let request = FailoverAuthRequest {
-                        requesting_node_id: local_node_id,
-                        config_epoch: requested_epoch,
-                        replication_offset,
-                        slot_bitmap,
-                    };
-                    let message =
-                        ClusterMessage::failover_auth(local_node_id, requested_epoch, request);
-                    for addr in self.primary_targets(failed_primary) {
-                        out.push(OutboundEnvelope {
-                            transport: Transport::Udp,
-                            addr,
-                            message: message.clone(),
-                        });
-                    }
+            && !auth_sent
+            && now_ms >= scheduled_at_ms
+        {
+            if let Some(campaign) = self.failover.as_mut() {
+                campaign.auth_sent = true;
+            }
+            if self.total_primary_count() <= 1 {
+                out.extend(self.promote_local(now_ms, rng));
+            } else {
+                let local_node_id = self.local_node_id();
+                let replication_offset = self
+                    .replication
+                    .get(&local_node_id)
+                    .map_or(0, |tracker| tracker.primary_repl_offset);
+                let slot_bitmap = slots_to_bitmap(&self.local_meta().slots);
+                let request = FailoverAuthRequest {
+                    requesting_node_id: local_node_id,
+                    config_epoch: requested_epoch,
+                    replication_offset,
+                    slot_bitmap,
+                };
+                let message =
+                    ClusterMessage::failover_auth(local_node_id, requested_epoch, request);
+                for addr in self.primary_targets(failed_primary) {
+                    out.push(OutboundEnvelope {
+                        transport: Transport::Udp,
+                        addr,
+                        message: message.clone(),
+                    });
                 }
             }
+        }
 
         out
     }

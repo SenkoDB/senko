@@ -86,11 +86,12 @@ fn build_pending_stream(count: usize) -> Store {
     if let Some(group) = store
         .get_stream_mut(b"bench-pel")
         .and_then(|stream| stream.groups.get_mut("g"))
-        && let Some(state) = group.consumers.get_mut("c1") {
-            for entry in state.pel.values_mut() {
-                entry.delivery_time = 0;
-            }
+        && let Some(state) = group.consumers.get_mut("c1")
+    {
+        for entry in state.pel.values_mut() {
+            entry.delivery_time = 0;
         }
+    }
     store
 }
 

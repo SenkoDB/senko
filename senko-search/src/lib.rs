@@ -1,14 +1,14 @@
 use std::{
     collections::HashSet,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
 
 use bytes::Bytes;
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use senko_core::{CommandRegistry, SenkoModule, ShardState};

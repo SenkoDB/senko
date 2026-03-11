@@ -299,8 +299,9 @@ impl ZSetObject {
             return ZSetRangeIter::new(Vec::new());
         };
         let mut entries: Vec<(f64, CompactString)> = match &self.inner {
-            ZSetEncoding::Listpack(node) => lp_zset_range_by_rank(node, start as u64, stop as u64)
-                .collect(),
+            ZSetEncoding::Listpack(node) => {
+                lp_zset_range_by_rank(node, start as u64, stop as u64).collect()
+            }
             ZSetEncoding::BPTree { tree, .. } => {
                 tree.range_by_rank(start as u64, stop as u64).collect()
             }
@@ -319,8 +320,7 @@ impl ZSetObject {
         limit: Option<(i64, i64)>,
     ) -> ZSetRangeIter<'_> {
         let mut entries: Vec<(f64, CompactString)> = match &self.inner {
-            ZSetEncoding::Listpack(node) => lp_zset_range_by_score(node, min, max)
-                .collect(),
+            ZSetEncoding::Listpack(node) => lp_zset_range_by_score(node, min, max).collect(),
             ZSetEncoding::BPTree { tree, .. } => tree.range_by_score(min, max).collect(),
         };
         if reverse {

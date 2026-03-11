@@ -348,8 +348,7 @@ fn bf_insert(ctx: &mut dyn ModuleCommandContext, args: &[&[u8]]) -> ModuleResult
                 index += 2;
             }
             token if token.eq_ignore_ascii_case(b"ERROR") => {
-                error_rate =
-                    parse_f64(args.get(index + 1).ok_or_else(|| err(ProbError::Syntax))?)?;
+                error_rate = parse_f64(args.get(index + 1).ok_or_else(|| err(ProbError::Syntax))?)?;
                 index += 2;
             }
             token if token.eq_ignore_ascii_case(b"EXPANSION") => {
@@ -579,8 +578,7 @@ fn cf_insert_impl(ctx: &mut dyn ModuleCommandContext, args: &[&[u8]], nx: bool) 
     while index < args.len() && !args[index].eq_ignore_ascii_case(b"ITEMS") {
         match args[index] {
             token if token.eq_ignore_ascii_case(b"CAPACITY") => {
-                capacity =
-                    parse_usize(args.get(index + 1).ok_or_else(|| err(ProbError::Syntax))?)?;
+                capacity = parse_usize(args.get(index + 1).ok_or_else(|| err(ProbError::Syntax))?)?;
                 index += 2;
             }
             token if token.eq_ignore_ascii_case(b"NOCREATE") => {
@@ -1291,7 +1289,7 @@ fn tdigest_info(ctx: &mut dyn ModuleCommandContext, args: &[&[u8]]) -> ModuleRes
 
 #[cfg(test)]
 mod tests {
-    use super::{type_string, ProbError, ProbModule};
+    use super::{ProbError, ProbModule, type_string};
     use senko_core::{CommandRegistry, SenkoModule, SenkoValue, TDigest, TopKSketch};
 
     #[test]

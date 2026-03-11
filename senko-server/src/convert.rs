@@ -93,21 +93,14 @@ pub fn convert_redis_conf_to_toml(input: &Path) -> Result<String, ConfigError> {
             }
             "save" => {
                 if values.len() == 2 {
-                    config
-                        .persistence
-                        .save
-                        .push(senko_core::config::SavePoint {
-                            seconds: values[0].parse().map_err(|_| {
-                                ConfigError::ValidationError(format!(
-                                    "invalid save directive: {line}"
-                                ))
-                            })?,
-                            changes: values[1].parse().map_err(|_| {
-                                ConfigError::ValidationError(format!(
-                                    "invalid save directive: {line}"
-                                ))
-                            })?,
-                        });
+                    config.persistence.save.push(senko_core::config::SavePoint {
+                        seconds: values[0].parse().map_err(|_| {
+                            ConfigError::ValidationError(format!("invalid save directive: {line}"))
+                        })?,
+                        changes: values[1].parse().map_err(|_| {
+                            ConfigError::ValidationError(format!("invalid save directive: {line}"))
+                        })?,
+                    });
                 } else {
                     unknown.push(format!("save {}", values.join(" ")));
                 }

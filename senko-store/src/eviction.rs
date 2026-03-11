@@ -43,9 +43,9 @@ pub fn value_bytes(entry: &Entry) -> usize {
         senko_core::SenkoValue::Int(_) => std::mem::size_of::<i64>(),
         senko_core::SenkoValue::Float(_) => std::mem::size_of::<f64>(),
         #[cfg(feature = "json")]
-        senko_core::SenkoValue::Json(value) => senko_core::SenkoValue::Json(value.clone())
-            .as_bytes()
-            .len(),
+        senko_core::SenkoValue::Json(value) => {
+            senko_core::SenkoValue::Json(value.clone()).as_bytes().len()
+        }
         #[cfg(feature = "vector")]
         senko_core::SenkoValue::VectorSet(vset) => {
             let guard = vset.read();
@@ -69,7 +69,9 @@ pub fn value_bytes(entry: &Entry) -> usize {
         senko_core::SenkoValue::TopK(sketch) => {
             sketch.buckets.len() * std::mem::size_of::<senko_core::HkCell>()
                 + sketch
-                    .item_counts.keys().map(|item| item.len())
+                    .item_counts
+                    .keys()
+                    .map(|item| item.len())
                     .sum::<usize>()
         }
         #[cfg(feature = "prob")]
@@ -100,11 +102,7 @@ pub fn value_bytes(entry: &Entry) -> usize {
             std::mem::size_of_val(stream.as_ref())
                 + stream
                     .tree
-                    .range(
-                        senko_core::StreamId::ZERO,
-                        senko_core::StreamId::MAX,
-                        None,
-                    )
+                    .range(senko_core::StreamId::ZERO, senko_core::StreamId::MAX, None)
                     .map(|(_, fields)| {
                         fields
                             .into_iter()

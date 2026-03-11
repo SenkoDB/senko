@@ -227,10 +227,9 @@ impl Store {
                 lru_clock(clock_snapshot)
             };
 
-            if !expired
-                && !self.no_touch && entry.lru_clock.get() != now_lru {
-                    entry.lru_clock.set(now_lru);
-                }
+            if !expired && !self.no_touch && entry.lru_clock.get() != now_lru {
+                entry.lru_clock.set(now_lru);
+            }
         }
         if expired {
             let _ = self.remove_entry(key);

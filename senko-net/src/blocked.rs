@@ -387,9 +387,7 @@ fn mpop_ready(
     count: usize,
 ) -> Result<Response, SenkoError> {
     match store.get(key.as_bytes()) {
-        Some(senko_core::SenkoValue::List(_)) => {
-            mpop_now(store, key.as_bytes(), direction, count)
-        }
+        Some(senko_core::SenkoValue::List(_)) => mpop_now(store, key.as_bytes(), direction, count),
         Some(value) => Err(wrong_type(value, "list")),
         None => Ok(Response::NullArray),
     }

@@ -229,9 +229,7 @@ pub fn xsetid(store: &mut Store, args: &[Frame<'_>]) -> SenkoResult<Response> {
             }
             let max_deleted_id = StreamId::parse(arg_bytes(&args[index])?)?;
             if max_deleted_id < stream.tree.max_deleted_entry_id {
-                return Err(SenkoError::Protocol(
-                    "ERR max_deleted_id must not decrease",
-                ));
+                return Err(SenkoError::Protocol("ERR max_deleted_id must not decrease"));
             }
             stream.tree.max_deleted_entry_id = max_deleted_id;
             index += 1;

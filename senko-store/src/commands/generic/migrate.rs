@@ -339,11 +339,7 @@ fn read_value(data: &[u8], cursor: &mut usize) -> Result<SenkoValue, SenkoError>
             for _ in 0..len {
                 let field = read_blob(data, cursor)?;
                 let value = read_blob(data, cursor)?;
-                let _ = hash.set(
-                    parse_key(&field)?,
-                    SenkoValue::encode_attempt(&value),
-                    None,
-                );
+                let _ = hash.set(parse_key(&field)?, SenkoValue::encode_attempt(&value), None);
             }
             Ok(SenkoValue::Hash(Box::new(hash)))
         }

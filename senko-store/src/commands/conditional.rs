@@ -205,9 +205,7 @@ mod tests {
         let expected_hex = super::digest_hex_16(b"hello");
         assert_eq!(
             res,
-            Response::Value(Some(SenkoValue::Raw(Bytes::copy_from_slice(
-                &expected_hex
-            ))))
+            Response::Value(Some(SenkoValue::Raw(Bytes::copy_from_slice(&expected_hex))))
         );
     }
 
@@ -224,9 +222,7 @@ mod tests {
         let expected_hex = super::digest_hex_16(b"42");
         assert_eq!(
             res,
-            Response::Value(Some(SenkoValue::Raw(Bytes::copy_from_slice(
-                &expected_hex
-            ))))
+            Response::Value(Some(SenkoValue::Raw(Bytes::copy_from_slice(&expected_hex))))
         );
     }
 

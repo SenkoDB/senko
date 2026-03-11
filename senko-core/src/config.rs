@@ -298,15 +298,13 @@ pub enum MaxMemoryPolicy {
     NoEviction,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum MaxMemoryClients {
     #[default]
     Disabled,
     Bytes(ByteSize),
     Percentage(f64),
 }
-
 
 impl Serialize for MaxMemoryClients {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -1216,7 +1214,6 @@ impl Default for ClientsConfig {
     }
 }
 
-
 impl Default for AofConfig {
     fn default() -> Self {
         Self {
@@ -1238,7 +1235,6 @@ impl Default for AofConfig {
         }
     }
 }
-
 
 pub static CONFIG_ALIASES: phf::Map<&'static str, &'static str> = phf_map! {
     "bind" => "network.bind",
@@ -1824,26 +1820,27 @@ fn load_value_with_includes(path: &Path, depth: usize) -> Result<Value, ConfigEr
 fn read_include_patterns(value: &Value) -> Result<Vec<String>, ConfigError> {
     let mut includes = Vec::new();
     if let Some(general) = value.get("general").and_then(Value::as_table)
-        && let Some(include) = general.get("include") {
-            match include {
-                Value::String(single) => includes.push(single.clone()),
-                Value::Array(values) => {
-                    for value in values {
-                        let item = value.as_str().ok_or_else(|| {
-                            ConfigError::ValidationError(
-                                "general.include entries must be strings".to_owned(),
-                            )
-                        })?;
-                        includes.push(item.to_owned());
-                    }
-                }
-                _ => {
-                    return Err(ConfigError::ValidationError(
-                        "general.include must be a string or array of strings".to_owned(),
-                    ));
+        && let Some(include) = general.get("include")
+    {
+        match include {
+            Value::String(single) => includes.push(single.clone()),
+            Value::Array(values) => {
+                for value in values {
+                    let item = value.as_str().ok_or_else(|| {
+                        ConfigError::ValidationError(
+                            "general.include entries must be strings".to_owned(),
+                        )
+                    })?;
+                    includes.push(item.to_owned());
                 }
             }
+            _ => {
+                return Err(ConfigError::ValidationError(
+                    "general.include must be a string or array of strings".to_owned(),
+                ));
+            }
         }
+    }
     Ok(includes)
 }
 

@@ -233,9 +233,7 @@ fn map_hll_error(error: HllError) -> SenkoError {
         HllError::WrongType => {
             SenkoError::Protocol("ERR WRONGTYPE Key is not a valid HyperLogLog string value")
         }
-        HllError::InvalidObject => {
-            SenkoError::Protocol("INVALIDOBJ Corrupted HLL object detected")
-        }
+        HllError::InvalidObject => SenkoError::Protocol("INVALIDOBJ Corrupted HLL object detected"),
     }
 }
 

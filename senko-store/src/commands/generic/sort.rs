@@ -268,9 +268,9 @@ fn materialize_results(
             }
             let key = substitute(pattern, element);
             match store.get(key.as_bytes()) {
-                Some(
-                    value @ (SenkoValue::Raw(_) | SenkoValue::Int(_) | SenkoValue::Float(_)),
-                ) => out.push(Some(value.as_bytes().into_owned())),
+                Some(value @ (SenkoValue::Raw(_) | SenkoValue::Int(_) | SenkoValue::Float(_))) => {
+                    out.push(Some(value.as_bytes().into_owned()))
+                }
                 Some(other) => {
                     return Err(SenkoError::WrongType {
                         expected: "string",

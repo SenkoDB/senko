@@ -99,9 +99,7 @@ impl MonitorEngine {
         self.links
             .entry(addr)
             .or_insert_with(|| InstanceLink::new(addr));
-        self.info_cache
-            .entry(name.to_owned())
-            .or_default();
+        self.info_cache.entry(name.to_owned()).or_default();
     }
 
     pub fn queue_command(&mut self, addr: SocketAddr, command: SentinelCommand) {

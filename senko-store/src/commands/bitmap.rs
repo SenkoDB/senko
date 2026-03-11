@@ -822,11 +822,7 @@ fn parse_overflow_mode(raw: &[u8]) -> SenkoResult<OverflowMode> {
     }
 }
 
-fn read_bitfield_value(
-    bitmap: &BitmapBuf,
-    enc: BitfieldEncoding,
-    offset: u64,
-) -> SenkoResult<i64> {
+fn read_bitfield_value(bitmap: &BitmapBuf, enc: BitfieldEncoding, offset: u64) -> SenkoResult<i64> {
     let end = offset
         .checked_add(enc.width() as u64)
         .ok_or_else(bit_offset_error)?

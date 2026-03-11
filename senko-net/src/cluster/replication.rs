@@ -583,9 +583,10 @@ impl ShardReplication {
     pub fn append_command(&self, cmd_bytes: &[u8]) -> Result<u64, ReplError> {
         let offset = self.backlog.try_append(cmd_bytes)?;
         if self.snapshot_in_progress.load(Ordering::Acquire)
-            && let Ok(mut delta) = self.snapshot_delta.lock() {
-                delta.push(ReplFrame::command(self.shard, offset, cmd_bytes.to_vec()));
-            }
+            && let Ok(mut delta) = self.snapshot_delta.lock()
+        {
+            delta.push(ReplFrame::command(self.shard, offset, cmd_bytes.to_vec()));
+        }
         Ok(offset)
     }
 

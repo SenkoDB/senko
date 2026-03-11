@@ -273,13 +273,10 @@ mod tests {
     #[test]
     fn no_save_clears_schedule() {
         let mut config = SenkoConfig::default();
-        config
-            .persistence
-            .save
-            .push(senko_core::config::SavePoint {
-                seconds: 60,
-                changes: 1,
-            });
+        config.persistence.save.push(senko_core::config::SavePoint {
+            seconds: 60,
+            changes: 1,
+        });
         let overrides = CliOverrides {
             no_save: true,
             ..CliOverrides::default()

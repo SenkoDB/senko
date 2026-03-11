@@ -612,9 +612,7 @@ fn parse_geo_search_options(
                 index += 1;
             }
         } else if token.eq_ignore_ascii_case(b"any") {
-            return Err(SenkoError::Protocol(
-                "ERR ANY option requires COUNT option",
-            ));
+            return Err(SenkoError::Protocol("ERR ANY option requires COUNT option"));
         } else if token.eq_ignore_ascii_case(b"asc") {
             if !matches!(order, GeoOrder::None) {
                 return Err(SenkoError::Protocol("syntax error"));
@@ -661,9 +659,7 @@ fn parse_geo_search_options(
         ));
     }
     if any && count.is_none() {
-        return Err(SenkoError::Protocol(
-            "ERR ANY option requires COUNT option",
-        ));
+        return Err(SenkoError::Protocol("ERR ANY option requires COUNT option"));
     }
 
     Ok(GeoSearchOptions {

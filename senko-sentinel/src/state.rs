@@ -101,8 +101,7 @@ pub enum FailoverState {
     UpdateConfig,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum Role {
     Master,
     Slave,
@@ -110,24 +109,19 @@ pub enum Role {
     Unknown,
 }
 
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum LinkStatus {
     Ok,
     #[default]
     Err,
 }
 
-
-#[derive(Clone, Debug)]
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 pub struct TiltState {
     pub tilt_start_time: u64,
     pub tilt_mode: bool,
     pub previous_time: u64,
 }
-
 
 impl TiltState {
     pub fn observe(&mut self, now: u64) -> Option<bool> {

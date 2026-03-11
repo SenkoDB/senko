@@ -124,9 +124,9 @@ impl<'a> Iterator for FrameIter<'a> {
                         self.emitted += 1;
                         Some(Ok(frame))
                     }
-                    Ok(ParseStatus::Incomplete(_)) => Some(Err(
-                        senko_core::SenkoError::Protocol("aggregate data ended mid-frame"),
-                    )),
+                    Ok(ParseStatus::Incomplete(_)) => Some(Err(senko_core::SenkoError::Protocol(
+                        "aggregate data ended mid-frame",
+                    ))),
                     Err(error) => Some(Err(error)),
                 }
             }

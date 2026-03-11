@@ -44,11 +44,7 @@ impl SentinelClientPool {
             .await
     }
 
-    pub async fn publish_hello(
-        &mut self,
-        addr: SocketAddr,
-        payload: &str,
-    ) -> SenkoResult<Vec<u8>> {
+    pub async fn publish_hello(&mut self, addr: SocketAddr, payload: &str) -> SenkoResult<Vec<u8>> {
         self.request(
             addr,
             &[b"PUBLISH", b"__sentinel__:hello", payload.as_bytes()],
@@ -76,9 +72,7 @@ impl SentinelClientPool {
         let parser = RespParser::new();
         match parser.parse(&input)? {
             ParseStatus::Complete(_, _) => Ok(input),
-            ParseStatus::Incomplete(_) => {
-                Err(SenkoError::Protocol("incomplete sentinel response"))
-            }
+            ParseStatus::Incomplete(_) => Err(SenkoError::Protocol("incomplete sentinel response")),
         }
     }
 }
