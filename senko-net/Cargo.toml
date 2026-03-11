@@ -34,6 +34,7 @@ senko-pubsub = { path = "../senko-pubsub" }
 senko-proto = { path = "../senko-proto" }
 senko-store = { path = "../senko-store" }
 socket2.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }

@@ -43,6 +43,7 @@ use senko_store::{
         bzpopmin,
     },
 };
+use tracing::debug;
 
 use crate::{
     acl::{self, AclContext},
@@ -299,6 +300,13 @@ impl Connection {
     }
 
     pub async fn run(mut self, config: &SenkoConfig) -> SenkoResult<()> {
+        debug!(
+            shard = self.shard_id,
+            conn_id = self.meta.id,
+            peer_addr = %self.meta.peer_addr,
+            local_addr = %self.meta.local_addr,
+            "connection started"
+        );
         loop {
             if self.flush_pubsub_messages().await? {
                 self.cleanup_connection_state();
@@ -394,6 +402,12 @@ impl Connection {
                     self.cleanup_connection_state();
                     self.phase = ConnectionPhase::Closing;
                     self.stream.shutdown().await?;
+                    debug!(
+                        shard = self.shard_id,
+                        conn_id = self.meta.id,
+                        peer_addr = %self.meta.peer_addr,
+                        "connection closed after write"
+                    );
                     return Ok(());
                 }
             }
@@ -416,6 +430,12 @@ impl Connection {
                 self.cleanup_connection_state();
                 self.phase = ConnectionPhase::Closing;
                 self.stream.shutdown().await?;
+                debug!(
+                    shard = self.shard_id,
+                    conn_id = self.meta.id,
+                    peer_addr = %self.meta.peer_addr,
+                    "connection closed by peer"
+                );
                 return Ok(());
             }
         }

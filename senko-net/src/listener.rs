@@ -17,6 +17,7 @@ use futures_util::{StreamExt, stream::FuturesUnordered};
 use senko_core::{ModuleRegistry, SenkoConfig, SenkoResult, ShardExtensions, ShardState};
 use senko_store::Store;
 use socket2::{Domain, Protocol, Socket, Type};
+use tracing::debug;
 
 use crate::{
     acl,
@@ -76,6 +77,11 @@ pub async fn run_shard(
     prepared: PreparedListener,
     module_registry: Arc<ModuleRegistry>,
 ) -> SenkoResult<()> {
+    debug!(
+        shard = shard_index,
+        bind_addr = %config.bind_addr,
+        "shard runtime initialized"
+    );
     crate::modules::init(Arc::clone(&module_registry));
     live_config::init(&config);
     command_info::init(&config);
@@ -165,6 +171,12 @@ pub async fn run_shard(
 
         let (stream, peer_addr) = listener.accept_with_options(&accept_opts).await?;
         let local_addr = stream.local_addr()?;
+        debug!(
+            shard = shard_index,
+            peer_addr = %peer_addr,
+            local_addr = %local_addr,
+            "accepted connection"
+        );
         server_info::on_connection_open(shard_index);
         let connection = Connection::new(
             shard_index,

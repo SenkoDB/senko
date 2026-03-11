@@ -34,3 +34,4 @@ senko-ts = { path = "../senko-ts", optional = true }
 senko-sentinel = { path = "../senko-sentinel" }
 socket2.workspace = true
 toml.workspace = true
+tracing.workspace = true

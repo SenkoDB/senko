@@ -1,5 +1,6 @@
 mod cli;
 mod convert;
+mod logging;
 
 use std::{collections::HashSet, env, sync::Arc, thread};
 
@@ -11,8 +12,7 @@ use convert::write_converted_config;
 use core_affinity::CoreId;
 use mimalloc::MiMalloc;
 use senko_core::{
-    ModuleRegistry, SenkoModule, SenkoConfig, SenkoError, SenkoResult,
-    render_default_config_toml,
+    ModuleRegistry, SenkoConfig, SenkoError, SenkoModule, SenkoResult, render_default_config_toml,
 };
 use senko_net::{PreparedListener, prepare_listeners, run_shard};
 use senko_sentinel::{
@@ -86,6 +86,13 @@ fn spawn_shards(
 }
 
 fn run_server_mode(config: SenkoConfig) -> SenkoResult<()> {
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        bind_addr = %config.bind_addr,
+        shards = config.num_shards,
+        max_connections = config.max_connections,
+        "starting senko server"
+    );
     let listeners = prepare_listeners(&config)?;
     let workers = spawn_shards(config, listeners, built_in_modules());
     for worker in workers {
@@ -180,6 +187,7 @@ fn run_app() -> SenkoResult<()> {
     }
 
     let config = load_effective_config(&cli).map_err(map_config_error)?;
+    logging::init(&config)?;
     run_server_mode(config)
 }
 

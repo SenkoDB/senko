@@ -57,4 +57,5 @@ simdutf8 = { version = "=0.1.5" }
 smallvec = { version = "=1.15.1" }
 socket2 = { version = "=0.5.10", features = ["all"] }
 toml = { version = "=0.9.8" }
+tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
 xxhash-rust = { version = "=0.8.15", features = ["xxh3"] }
