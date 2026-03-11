@@ -1,0 +1,48 @@
+# senko Sentinel Configuration
+# Run with: senkodb --sentinel sentinel.toml
+# Or Redis-compat: senkodb /path/to/sentinel.conf
+
+[network]
+port = 26379
+# bind = ["127.0.0.1"]   # default: all interfaces
+protected_mode = false
+# announce_ip = "1.2.3.4"
+# announce_port = 26379
+resolve_hostnames = false
+announce_hostnames = false
+
+[general]
+dir = "/tmp"
+daemonize = false
+# pidfile = "/var/run/senko-sentinel.pid"
+loglevel = "notice"
+# logfile = "/var/log/senko-sentinel.log"
+sentinel_hz = 1000
+
+[security]
+# requirepass = "strongpassword"
+# aclfile = "/etc/senko/sentinel-users.acl"
+acllog_max_len = 128
+deny_scripts_reconfig = true
+
+# sentinel_user = "sentinel-user"
+# sentinel_pass = "sentinelpass"
+
+[[masters]]
+name = "mymaster"
+host = "127.0.0.1"
+port = 6379
+quorum = 2
+down_after_milliseconds = 30000
+parallel_syncs = 1
+failover_timeout = 180000
+
+# auth_pass = "redispassword"
+# auth_user = "sentinel-user"
+# notification_script = "/var/redis/notify.sh"
+# client_reconfig_script = "/var/redis/reconfig.sh"
+# master_reboot_down_after_period = 0
+
+# [masters.rename_commands]
+# CONFIG = "GUESSME"
+# SLAVEOF = "DOITALL"

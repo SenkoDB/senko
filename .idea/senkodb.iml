@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<module type="EMPTY_MODULE" version="4">
+  <component name="NewModuleRootManager">
+    <content url="file://$MODULE_DIR$">
+      <sourceFolder url="file://$MODULE_DIR$/senko-prob/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/senko-search/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/senko-ts/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/senko-vector/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/senko-cluster/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/senko-core/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/senko-json/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/senko-net/benches" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/senko-net/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/senko-net/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/senko-proto/benches" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/senko-proto/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/senko-proto/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/senko-pubsub/benches" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/senko-pubsub/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/senko-sentinel/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/senko-server/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/senko-store/benches" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/senko-store/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/senko-store/tests" isTestSource="true" />
+      <excludeFolder url="file://$MODULE_DIR$/target" />
+    </content>
+    <orderEntry type="inheritedJdk" />
+    <orderEntry type="sourceFolder" forTests="false" />
+  </component>
+</module>

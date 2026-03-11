@@ -1,0 +1,60 @@
+[workspace]
+members = [
+  "senko-prob",
+  "senko-vector",
+  "senko-search",
+  "senko-ts",
+  "senko-core",
+  "senko-proto",
+  "senko-store",
+  "senko-net",
+  "senko-server",
+  "senko-sentinel",
+  "senko-cluster",
+  "senko-pubsub",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Codex"]
+
+[workspace.dependencies]
+ahash = { version = "=0.8.12" }
+aho-corasick = { version = "=1.1.4" }
+arc-swap = { version = "=1.7.1" }
+bitflags = { version = "=2.10.0" }
+bytes = { version = "=1.11.1", default-features = false, features = ["std"] }
+clap = { version = "=4.5.53", features = ["derive"] }
+compact_str = { version = "=0.9.0", default-features = false, features = ["std"] }
+compio = { version = "=0.18.0", default-features = false, features = [
+  "runtime",
+  "io",
+  "net",
+  "macros",
+  "polling",
+  "time",
+] }
+core_affinity = { version = "=0.8.3" }
+futures-util = { version = "=0.3.31", default-features = false, features = ["std"] }
+flume = { version = "=0.12.0", default-features = false }
+hashbrown = { version = "=0.16.1", default-features = false, features = [
+  "inline-more",
+  "equivalent",
+  "raw-entry",
+  "allocator-api2",
+] }
+hdrhistogram = { version = "=7.5.4", default-features = false }
+memchr = { version = "=2.8.0" }
+mimalloc = { version = "=0.1.48", default-features = false }
+num_cpus = { version = "=1.17.0" }
+phf = { version = "=0.13.1", features = ["macros"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_yaml = { version = "=0.9.34" }
+simdutf8 = { version = "=0.1.5" }
+smallvec = { version = "=1.15.1" }
+socket2 = { version = "=0.5.10", features = ["all"] }
+toml = { version = "=0.9.8" }
+xxhash-rust = { version = "=0.8.15", features = ["xxh3"] }

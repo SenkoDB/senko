@@ -1,0 +1,78 @@
+[package]
+name = "senko-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+default = ["json", "vector", "prob"]
+prob = ["senko-core/prob"]
+simd = ["senko-core/simd", "senko-proto/simd"]
+json = ["senko-core/json"]
+vector = ["senko-core/vector"]
+
+[dependencies]
+ahash.workspace = true
+bytes.workspace = true
+compact_str.workspace = true
+hashbrown.workspace = true
+fast-float = { version = "=0.2.0" }
+ryu = { version = "=1.0.23" }
+smallvec = { version = "=1.15.1" }
+subtle = { version = "=2.6.1" }
+xxhash-rust.workspace = true
+rand = { version = "=0.8.5", default-features = false, features = ["small_rng", "std"] }
+memchr.workspace = true
+roaring = "0.11.2"
+crc = "3.3.0"
+senko-core = { path = "../senko-core" }
+senko-proto = { path = "../senko-proto" }
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+proptest = { version = "1.10.0", default-features = false, features = ["std"] }
+futures-util.workspace = true
+redis = { version = "1", features = ["aio", "smol-comp"] }
+blake3 = { version = "=0.2" }
+smol = { version = "2.0.2" }
+
+[[bench]]
+name = "store"
+harness = false
+
+[[bench]]
+name = "conditional_timing"
+harness = false
+
+[[bench]]
+name = "lcs"
+harness = false
+
+[[bench]]
+name = "hash"
+harness = false
+
+[[bench]]
+name = "list"
+harness = false
+
+[[bench]]
+name = "set"
+harness = false
+
+[[bench]]
+name = "zset"
+harness = false
+
+[[bench]]
+name = "stream"
+harness = false
+
+[[bench]]
+name = "generic"
+harness = false
+
+[[bench]]
+name = "transaction"
+harness = false

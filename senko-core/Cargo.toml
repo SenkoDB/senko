@@ -1,0 +1,32 @@
+[package]
+name = "senko-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+json = ["dep:sonic-rs"]
+prob = []
+simd = ["dep:simdutf8"]
+vector = ["dep:parking_lot"]
+
+[dependencies]
+ahash.workspace = true
+bytes.workspace = true
+bytesize = "1"
+compact_str.workspace = true
+fastrand = "1"
+hashbrown.workspace = true
+humantime = "2"
+memchr.workspace = true
+num_cpus.workspace = true
+phf.workspace = true
+rand = { version = "=0.8.5", default-features = false, features = ["small_rng", "std"] }
+serde = { version = "1", features = ["derive"] }
+smallvec = { version = "=1.15.1" }
+simdutf8 = { workspace = true, optional = true }
+sonic-rs = { version = "0.5.7", optional = true }
+parking_lot = { version = "0.12", optional = true }
+toml = "0.8"

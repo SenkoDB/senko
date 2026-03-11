@@ -1,0 +1,14 @@
+[package]
+name = "senko-cluster"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ahash.workspace = true
+hashbrown.workspace = true
+memchr.workspace = true
+num_cpus.workspace = true
+rand = { version = "=0.8.5", default-features = false, features = ["small_rng", "std"] }
+roaring = "0.11.2"

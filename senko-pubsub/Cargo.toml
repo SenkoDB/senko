@@ -1,0 +1,25 @@
+[package]
+name = "senko-pubsub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ahash.workspace = true
+aho-corasick.workspace = true
+bytes.workspace = true
+compact_str.workspace = true
+futures-util.workspace = true
+hashbrown.workspace = true
+memchr.workspace = true
+smallvec.workspace = true
+
+[dev-dependencies]
+core_affinity.workspace = true
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+senko-net = { path = "../senko-net" }
+
+[[bench]]
+name = "pubsub"
+harness = false

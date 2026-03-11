@@ -1,0 +1,36 @@
+[package]
+name = "senko-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+json = ["dep:senko-json", "senko-core/json", "senko-net/json"]
+module-prob = ["dep:senko-prob", "senko-core/prob", "senko-net/prob", "senko-store/prob"]
+module-json = ["dep:senko-json", "senko-core/json", "senko-net/json"]
+module-search = ["dep:senko-search"]
+module-ts = ["dep:senko-ts"]
+module-vector = ["dep:senko-vector", "senko-core/vector", "senko-net/vector"]
+simd = ["senko-net/simd"]
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+compio.workspace = true
+core_affinity.workspace = true
+mimalloc.workspace = true
+num_cpus.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+senko-core = { path = "../senko-core" }
+senko-prob = { path = "../senko-prob", optional = true }
+senko-json = { path = "../senko-json", optional = true }
+senko-net = { path = "../senko-net" }
+senko-store = { path = "../senko-store", optional = true }
+senko-vector = { path = "../senko-vector", optional = true }
+senko-search = { path = "../senko-search", optional = true }
+senko-ts = { path = "../senko-ts", optional = true }
+senko-sentinel = { path = "../senko-sentinel" }
+socket2.workspace = true
+toml.workspace = true

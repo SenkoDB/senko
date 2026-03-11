@@ -1,0 +1,52 @@
+[package]
+build = "build.rs"
+name = "senko-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+default = ["json", "vector", "prob"]
+prob = ["senko-store/prob", "senko-core/prob"]
+simd = ["senko-core/simd", "senko-proto/simd"]
+json = ["senko-store/json", "senko-core/json"]
+vector = ["senko-store/vector", "senko-core/vector"]
+
+[dependencies]
+ahash.workspace = true
+bytes.workspace = true
+compio.workspace = true
+compact_str.workspace = true
+getrandom = "=0.3.4"
+flume.workspace = true
+futures-util.workspace = true
+hashbrown.workspace = true
+hdrhistogram.workspace = true
+phf.workspace = true
+rand = { version = "=0.8.5", default-features = false, features = ["small_rng", "std"] }
+roaring = "0.11.2"
+sha2 = "=0.10.9"
+smallvec = { version = "=1.15.1" }
+senko-cluster = { path = "../senko-cluster" }
+senko-core = { path = "../senko-core" }
+senko-pubsub = { path = "../senko-pubsub" }
+senko-proto = { path = "../senko-proto" }
+senko-store = { path = "../senko-store" }
+socket2.workspace = true
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+redis = { version = "1" }
+
+[[bench]]
+name = "connection"
+harness = false
+
+[[bench]]
+name = "cluster"
+harness = false
+
+[[bench]]
+name = "server"
+harness = false

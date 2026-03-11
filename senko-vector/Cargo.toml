@@ -1,0 +1,21 @@
+[package]
+name = "senko-vector"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+senko-core = { path = "../senko-core", features = ["vector"] }
+rayon = "1.10"
+bytes = "1"
+thiserror = "2"
+ahash = "0.8"
+parking_lot = "0.12"
+smallvec = "1"
+rand = "0.8"
+fastrand = "1"
+serde_json = "1"
+
+[features]
+default = []

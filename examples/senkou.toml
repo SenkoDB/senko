@@ -1,0 +1,240 @@
+# senko reference configuration.
+# This file is generated from the built-in defaults and kept as a starting point.
+# Review and edit values before using it in production.
+#
+# Status note as of March 11, 2026:
+# - This file exposes a broad Redis-style configuration surface.
+# - Not every option below is fully implemented in senko runtime yet.
+# - Some options are active, some are only partially honored, and some are
+#   currently parsed/reflected through CONFIG/INFO without changing behavior.
+# - In particular, treat TLS, AOF, many replication/cluster knobs, lazyfree,
+#   keyspace notification, and plugin/module-related options as not production-
+#   ready unless you have verified the corresponding subsystem in code.
+#
+# High-confidence active groups:
+# - [network] bind/port/tcp_backlog/tcp_keepalive
+# - [memory] maxmemory/maxclients
+# - [slowlog]
+# - [latency]
+# - [persistence] dir/dbfilename are used by SAVE/BGSAVE snapshot output
+# - parts of [encoding], plus hll_sparse_max_bytes
+#
+# Known mismatches:
+# - network.io_threads controls shard count, not a separate I/O worker pool
+# - network.so_reuseport is currently effectively always on where supported
+# - AOF settings do not currently provide a full append-only persistence path
+# - Some INFO/CONFIG fields are surfaced for compatibility but are not enforced
+
+[network]
+bind = ["127.0.0.1", "::1"]
+port = 6000
+unixsocketperm = 448
+tcp_backlog = 511
+timeout = 0
+tcp_keepalive = 300
+protected_mode = true
+# Note: this currently maps to shard/thread count.
+io_threads = 32
+# Note: currently not honored as a real toggle on supported Unix targets.
+so_reuseport = true
+# Compatibility surface; not a confirmed runtime scheduling control.
+max_new_connections_per_cycle = 10
+
+[tls]
+# Parsed config surface only. Do not assume TLS server support is production-ready.
+port = 0
+auth_clients = "yes"
+auth_clients_user = "off"
+replication = false
+cluster = false
+protocols = ["TLSv1.2", "TLSv1.3"]
+ciphers = "DEFAULT:!MEDIUM"
+prefer_server_ciphers = false
+session_caching = true
+session_cache_size = 20480
+session_cache_timeout = 300
+
+[general]
+# Mixed support. Basic values are parsed; several process/system knobs below are
+# not guaranteed to have runtime effect yet.
+daemonize = false
+loglevel = "notice"
+syslog_enabled = false
+syslog_ident = "senko"
+syslog_facility = "local0"
+databases = 1
+always_show_logo = false
+set_proc_title = true
+proc_title_template = "{title} {listen-addr} {server-mode}"
+hz = 10
+dynamic_hz = true
+activerehashing = true
+disable_thp = true
+oom_score_adj = "no"
+oom_score_adj_values = [0, 200, 800]
+include = []
+ignore_warnings = []
+
+[security]
+# Mixed support. ACL basics exist; several limits and protected access knobs are
+# currently compatibility-facing rather than fully enforced.
+acllog_max_len = 128
+acl_pubsub_default = "resetchannels"
+users = []
+enable_protected_configs = "no"
+enable_debug_command = "no"
+enable_module_command = "no"
+client_output_buffer_limit = []
+client_query_buffer_limit = 1073741824
+proto_max_bulk_len = 536870912
+tracking_table_max_keys = 1000000
+
+[persistence]
+# Partial support. RDB-style SAVE/BGSAVE uses dir/dbfilename. Other knobs below
+# may not yet match Redis behavior exactly.
+save = []
+stop_writes_on_bgsave_error = true
+rdbcompression = true
+rdbchecksum = true
+dbfilename = "dump.rdb"
+dir = "./"
+rdb_del_sync_files = false
+sanitize_dump_payload = "clients"
+
+[replication]
+# Partial/incomplete. Do not assume Redis-complete replication semantics from
+# these settings alone.
+replica_serve_stale_data = true
+replica_read_only = true
+repl_diskless_sync = true
+repl_diskless_sync_delay = 5
+repl_diskless_sync_max_replicas = 0
+repl_diskless_load = "disabled"
+repl_ping_replica_period = 10
+repl_timeout = 60
+repl_disable_tcp_nodelay = false
+repl_backlog_size = 1048576
+repl_backlog_ttl = 3600
+replica_priority = 100
+min_replicas_to_write = 0
+min_replicas_max_lag = 10
+propagation_error_behavior = "ignore"
+replica_ignore_maxmemory = true
+replica_full_sync_buffer_limit = 0
+shutdown_timeout = 10
+
+[cluster]
+# Partial/incomplete. Cluster config is present for compatibility, but many of
+# these settings are not fully implemented as Redis-compatible behavior.
+enabled = false
+config_file = "nodes-6379.conf"
+node_timeout = 15000
+port = 0
+replica_validity_factor = 10
+migration_barrier = 1
+allow_replica_migration = true
+require_full_coverage = true
+replica_no_failover = false
+allow_reads_when_down = false
+allow_pubsubshard_when_down = true
+link_sendbuf_limit = 0
+preferred_endpoint_type = "ip"
+compatibility_sample_ratio = 0
+slot_stats_enabled = "no"
+slot_migration_write_pause_timeout = 10000
+slot_migration_handoff_max_lag_bytes = 1048576
+
+[memory]
+# Partially active. maxmemory/maxclients are active; many advanced eviction and
+# defrag tuning options are not fully wired yet.
+maxmemory = 0
+maxmemory_policy = "no-eviction"
+maxmemory_samples = 5
+maxmemory_eviction_tenacity = 10
+maxclients = 10000
+maxmemory_clients = 0
+activedefrag = false
+active_defrag_ignore_bytes = 104857600
+active_defrag_threshold_lower = 10
+active_defrag_threshold_upper = 100
+active_defrag_cycle_min = 1
+active_defrag_cycle_max = 25
+active_defrag_max_scan_fields = 1000
+lfu_log_factor = 10
+lfu_decay_time = 1
+active_expire_effort = 1
+jemalloc_bg_thread = true
+
+[eviction]
+# Placeholder section.
+
+[encoding]
+# Mostly active for data structure sizing thresholds. Some entries remain
+# compatibility-facing until the corresponding type/subsystem exists.
+hash_max_listpack_entries = 512
+hash_max_listpack_value = 64
+list_max_listpack_size = -2
+list_compress_depth = 0
+set_max_intset_entries = 512
+set_max_listpack_entries = 128
+set_max_listpack_value = 64
+zset_max_listpack_entries = 128
+zset_max_listpack_value = 64
+hll_sparse_max_bytes = 3000
+stream_node_max_bytes = 4096
+stream_node_max_entries = 100
+stream_idmp_duration = 100
+stream_idmp_maxsize = 100
+
+[pubsub]
+# subscriber_ring_size may affect implementation details over time.
+# notify_keyspace_events should be treated as not fully implemented.
+notify_keyspace_events = ""
+subscriber_ring_size = 256
+
+[slowlog]
+log_slower_than = 10000
+max_len = 128
+
+[latency]
+monitor_threshold = 0
+tracking = true
+tracking_info_percentiles = [50.0, 99.0, 99.9]
+
+[clients]
+lookahead = 16
+key_memory_histograms = false
+
+[lazyfree]
+# Compatibility surface; lazy free behavior is not fully implemented.
+lazy_eviction = false
+lazy_expire = false
+lazy_server_del = false
+replica_lazy_flush = false
+lazy_user_del = false
+lazy_user_flush = false
+
+[aof]
+# Not a full append-only persistence implementation yet. These settings are
+# retained for compatibility and future work.
+enabled = false
+filename = "appendonly.aof"
+dirname = "appendonlydir"
+fsync = "everysec"
+no_appendfsync_on_rewrite = false
+auto_aof_rewrite_percentage = 100
+auto_aof_rewrite_min_size = 67108864
+aof_load_truncated = true
+aof_load_corrupt_tail_max_size = 0
+aof_use_rdb_preamble = true
+aof_timestamp_enabled = false
+aof_rewrite_incremental_fsync = true
+rdb_save_incremental_fsync = true
+shutdown_on_sigint = "default"
+shutdown_on_sigterm = "default"
+
+[plugins]
+# Placeholder surface for future extensibility.
+enabled = []
+
+[plugins.extra]

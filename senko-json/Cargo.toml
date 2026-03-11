@@ -1,0 +1,16 @@
+[package]
+name = "senko-json"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+senko-core = { path = "../senko-core", features = ["json"] }
+sonic-rs = "0.5.7"
+bytes = "1"
+thiserror = "2"
+smallvec = "1"
+
+[features]
+default = []

@@ -1,0 +1,27 @@
+[package]
+name = "senko-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+simd = ["senko-core/simd", "dep:simdutf8"]
+
+[dependencies]
+bytes.workspace = true
+itoa = { version = "=1.0.17" }
+memchr.workspace = true
+ryu = { version = "=1.0.23" }
+senko-core = { path = "../senko-core" }
+simdutf8 = { workspace = true, optional = true }
+
+
+[dev-dependencies]
+criterion = { version = "=0.8.2", default-features = false, features = ["cargo_bench_support"] }
+proptest = { version = "=1.10.0", default-features = false, features = ["std"] }
+
+[[bench]]
+name = "parser"
+harness = false
