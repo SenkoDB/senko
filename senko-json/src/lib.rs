@@ -214,7 +214,7 @@ fn json_mget(ctx: &mut dyn ModuleCommandContext, args: &[&[u8]]) -> ModuleResult
 }
 
 fn json_mset(ctx: &mut dyn ModuleCommandContext, args: &[&[u8]]) -> ModuleResult {
-    if args.len() < 3 || args.len() % 3 != 0 {
+    if args.len() < 3 || !args.len().is_multiple_of(3) {
         return Err(err("ERR wrong number of arguments for 'json.mset' command"));
     }
 
@@ -739,7 +739,7 @@ fn remove_path(root: &mut JsonValue, path: &str) -> Result<usize, ModuleError> {
             let Some(idx) = normalize_existing_index(arr.len(), *index) else {
                 return Ok(0);
             };
-            let _ = arr.remove(idx);
+            arr.remove(idx);
             Ok(1)
         }
         JsonPathToken::Wildcard => {

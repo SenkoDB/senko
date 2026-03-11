@@ -3,7 +3,8 @@ use std::collections::HashSet;
 use bytes::Bytes;
 use compact_str::CompactString;
 use senko_core::{
-    ConsumerGroup, SenkoError, SenkoResult, SenkoValue, StreamId, StreamObject, StreamRefMode,
+    ConsumerGroup, SenkoError, SenkoResult, SenkoValue, StreamBorrowedEntry, StreamId,
+    StreamObject, StreamRefMode,
 };
 use senko_proto::Frame;
 use smallvec::SmallVec;
@@ -497,7 +498,7 @@ fn pending_detail_response(details: Vec<PendingDetail>) -> Response {
     Response::Array(Box::new(out))
 }
 
-fn entry_or_null(entry: Option<(StreamId, Vec<(&[u8], &[u8])>)>) -> Response {
+fn entry_or_null(entry: Option<StreamBorrowedEntry<'_>>) -> Response {
     let Some((id, fields)) = entry else {
         return Response::Value(None);
     };

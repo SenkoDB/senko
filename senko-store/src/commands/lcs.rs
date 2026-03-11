@@ -9,6 +9,7 @@ use crate::store::Store;
 const DEFAULT_MAX_CELLS: usize = 64_000_000;
 
 #[derive(Debug, Clone, Copy)]
+#[derive(Default)]
 struct LcsOptions {
     len_only: bool,
     idx: bool,
@@ -16,16 +17,6 @@ struct LcsOptions {
     min_match_len: usize,
 }
 
-impl Default for LcsOptions {
-    fn default() -> Self {
-        Self {
-            len_only: false,
-            idx: false,
-            with_match_len: false,
-            min_match_len: 0,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MatchRange {

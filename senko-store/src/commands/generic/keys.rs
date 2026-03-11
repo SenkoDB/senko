@@ -563,7 +563,7 @@ mod tests {
             type_cmd(&mut store, &[bs(b"src")]).unwrap(),
             Response::Simple(b"none")
         );
-        assert_eq!(store.ttl_ms(b"dst").unwrap() > 0, true);
+        assert!(store.ttl_ms(b"dst").unwrap() > 0);
     }
 
     #[test]

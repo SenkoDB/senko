@@ -299,17 +299,14 @@ pub enum MaxMemoryPolicy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Default)]
 pub enum MaxMemoryClients {
+    #[default]
     Disabled,
     Bytes(ByteSize),
     Percentage(f64),
 }
 
-impl Default for MaxMemoryClients {
-    fn default() -> Self {
-        Self::Disabled
-    }
-}
 
 impl Serialize for MaxMemoryClients {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -833,6 +830,7 @@ pub struct ClientsConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
+#[derive(Default)]
 pub struct LazyFreeConfig {
     pub lazy_eviction: bool,
     pub lazy_expire: bool,
@@ -864,6 +862,7 @@ pub struct AofConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
+#[derive(Default)]
 pub struct PluginConfig {
     pub enabled: Vec<String>,
     pub extra: BTreeMap<String, Value>,
@@ -1217,18 +1216,6 @@ impl Default for ClientsConfig {
     }
 }
 
-impl Default for LazyFreeConfig {
-    fn default() -> Self {
-        Self {
-            lazy_eviction: false,
-            lazy_expire: false,
-            lazy_server_del: false,
-            replica_lazy_flush: false,
-            lazy_user_del: false,
-            lazy_user_flush: false,
-        }
-    }
-}
 
 impl Default for AofConfig {
     fn default() -> Self {
@@ -1252,14 +1239,6 @@ impl Default for AofConfig {
     }
 }
 
-impl Default for PluginConfig {
-    fn default() -> Self {
-        Self {
-            enabled: Vec::new(),
-            extra: BTreeMap::default(),
-        }
-    }
-}
 
 pub static CONFIG_ALIASES: phf::Map<&'static str, &'static str> = phf_map! {
     "bind" => "network.bind",
@@ -1844,8 +1823,8 @@ fn load_value_with_includes(path: &Path, depth: usize) -> Result<Value, ConfigEr
 
 fn read_include_patterns(value: &Value) -> Result<Vec<String>, ConfigError> {
     let mut includes = Vec::new();
-    if let Some(general) = value.get("general").and_then(Value::as_table) {
-        if let Some(include) = general.get("include") {
+    if let Some(general) = value.get("general").and_then(Value::as_table)
+        && let Some(include) = general.get("include") {
             match include {
                 Value::String(single) => includes.push(single.clone()),
                 Value::Array(values) => {
@@ -1865,7 +1844,6 @@ fn read_include_patterns(value: &Value) -> Result<Vec<String>, ConfigError> {
                 }
             }
         }
-    }
     Ok(includes)
 }
 

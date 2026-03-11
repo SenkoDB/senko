@@ -719,15 +719,14 @@ impl GossipState {
             }
         }
 
-        if let Some(campaign) = &self.failover {
-            if campaign.auth_sent
+        if let Some(campaign) = &self.failover
+            && campaign.auth_sent
                 && self.can_promote_failover(campaign.failed_primary)
                 && self.failover_vote_count(campaign.failed_primary, &campaign.votes)
                     >= self.required_failover_votes(campaign.failed_primary)
             {
                 out.extend(self.promote_local(now_ms, rng));
             }
-        }
 
         out
     }
@@ -829,11 +828,10 @@ impl GossipState {
             .collect::<Vec<_>>();
 
         for node_id in suspected {
-            if selected.insert(node_id) {
-                if let Some(node) = self.cluster.get_node(&node_id) {
+            if selected.insert(node_id)
+                && let Some(node) = self.cluster.get_node(&node_id) {
                     entries.push(GossipEntry::from_meta(node));
                 }
-            }
         }
 
         let mut candidates = self
@@ -845,11 +843,10 @@ impl GossipState {
         candidates.shuffle(rng);
 
         for node_id in candidates.into_iter().take(sample_size) {
-            if selected.insert(node_id) {
-                if let Some(node) = self.cluster.get_node(&node_id) {
+            if selected.insert(node_id)
+                && let Some(node) = self.cluster.get_node(&node_id) {
                     entries.push(GossipEntry::from_meta(node));
                 }
-            }
         }
 
         entries
@@ -1079,13 +1076,12 @@ impl GossipState {
 
         for node_id in ids {
             let mut mark_pfail = false;
-            if let Some(node) = self.cluster.get_node(&node_id) {
-                if node.state != NodeState::Failed
+            if let Some(node) = self.cluster.get_node(&node_id)
+                && node.state != NodeState::Failed
                     && now_ms.saturating_sub(node.pong_recv) > self.node_timeout_ms
                 {
                     mark_pfail = true;
                 }
-            }
 
             if mark_pfail {
                 if let Some(node) = self.cluster.get_node_mut(&node_id) {
@@ -1165,8 +1161,7 @@ impl GossipState {
         });
         if let Some((failed_primary, requested_epoch, scheduled_at_ms, auth_sent)) =
             failover_snapshot
-        {
-            if !auth_sent && now_ms >= scheduled_at_ms {
+            && !auth_sent && now_ms >= scheduled_at_ms {
                 if let Some(campaign) = self.failover.as_mut() {
                     campaign.auth_sent = true;
                 }
@@ -1196,7 +1191,6 @@ impl GossipState {
                     }
                 }
             }
-        }
 
         out
     }

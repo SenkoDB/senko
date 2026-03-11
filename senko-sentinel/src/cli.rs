@@ -9,6 +9,7 @@ use crate::{
     config::{ConfigError, SentinelConfig, load_sentinel_config, render_default_config_toml},
 };
 
+#[allow(clippy::large_enum_variant)]
 pub enum SentinelCliAction {
     Run(SentinelConfig),
     Print(String),

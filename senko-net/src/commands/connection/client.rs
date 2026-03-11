@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use std::{cell::RefCell, collections::HashSet, rc::Rc};
 
 use bytes::Bytes;
@@ -479,12 +481,12 @@ fn client_phase2_placeholder(
             meta.tracking_redirect = -1;
         }
     }
-    if eq_ascii(subcommand, b"UNBLOCK") {
-        if let ConnectionState::Blocked { .. } = state {
-            blocked.borrow_mut().remove_client(meta.id);
-            *state = ConnectionState::Reading;
-            meta.flags.remove(ConnectionFlags::BLOCKED);
-        }
+    if eq_ascii(subcommand, b"UNBLOCK")
+        && let ConnectionState::Blocked { .. } = state
+    {
+        blocked.borrow_mut().remove_client(meta.id);
+        *state = ConnectionState::Reading;
+        meta.flags.remove(ConnectionFlags::BLOCKED);
     }
     if eq_ascii(subcommand, b"KILL")
         || eq_ascii(subcommand, b"PAUSE")

@@ -81,10 +81,10 @@ impl ClusterHarness {
             if let Some(meta) = node.gossip.cluster_mut().get_node_mut(&node_id) {
                 meta.state = NodeState::Failed;
             }
-            if let Some(topology) = node.cluster.borrow_mut().topology_mut() {
-                if let Some(meta) = topology.state_mut().get_node_mut(&node_id) {
-                    meta.state = NodeState::Failed;
-                }
+            if let Some(topology) = node.cluster.borrow_mut().topology_mut()
+                && let Some(meta) = topology.state_mut().get_node_mut(&node_id)
+            {
+                meta.state = NodeState::Failed;
             }
         }
     }
@@ -96,10 +96,10 @@ impl ClusterHarness {
             if let Some(meta) = node.gossip.cluster_mut().get_node_mut(&node_id) {
                 meta.state = NodeState::Connected;
             }
-            if let Some(topology) = node.cluster.borrow_mut().topology_mut() {
-                if let Some(meta) = topology.state_mut().get_node_mut(&node_id) {
-                    meta.state = NodeState::Connected;
-                }
+            if let Some(topology) = node.cluster.borrow_mut().topology_mut()
+                && let Some(meta) = topology.state_mut().get_node_mut(&node_id)
+            {
+                meta.state = NodeState::Connected;
             }
         }
     }
@@ -349,7 +349,7 @@ impl ClusterHarness {
 
     fn assign_roles_and_slots(&mut self) {
         let primary_slots = even_slot_ranges(self.n_primaries);
-        for primary_idx in 0..self.n_primaries {
+        for (primary_idx, _) in primary_slots.iter().enumerate().take(self.n_primaries) {
             let node_idx = primary_idx * (self.replicas_per_primary + 1);
             {
                 let mut state = self.nodes[node_idx].cluster.borrow_mut();

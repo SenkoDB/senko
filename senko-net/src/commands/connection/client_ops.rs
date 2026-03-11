@@ -1,3 +1,5 @@
+#![allow(clippy::await_holding_lock, clippy::too_many_arguments)]
+
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -247,16 +249,16 @@ fn client_kill(
         let Some(handle) = find_by_addr(client_connections, addr) else {
             return Err(error_message("ERR No such client"));
         };
-        if let Some(target_id) = kill_handle(handle, meta.id, blocked, true) {
-            if target_id == meta.id {
-                clear_watch_state(meta.id, watch_registry, watch_state);
-                return Ok(ClientCommandOutcome {
-                    response: simple_string(b"OK"),
-                    close_after_write: true,
-                    suppress_response: false,
-                    force_send_response: false,
-                });
-            }
+        if let Some(target_id) = kill_handle(handle, meta.id, blocked, true)
+            && target_id == meta.id
+        {
+            clear_watch_state(meta.id, watch_registry, watch_state);
+            return Ok(ClientCommandOutcome {
+                response: simple_string(b"OK"),
+                close_after_write: true,
+                suppress_response: false,
+                force_send_response: false,
+            });
         }
         return Ok(ok_outcome(simple_string(b"OK")));
     }
@@ -617,7 +619,7 @@ fn kill_handle(
         let writer = handle.writer.clone();
         spawn(async move {
             let mut writer = writer.lock().expect("writer poisoned");
-            let _ = (&mut *writer).shutdown().await;
+            let _ = (*writer).shutdown().await;
         })
         .detach();
     }

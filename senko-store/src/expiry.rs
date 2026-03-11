@@ -149,10 +149,8 @@ impl FieldExpiryWheel {
         while self.last_tick_ms < target {
             self.last_tick_ms = self.last_tick_ms.saturating_add(WHEEL_RESOLUTION_MS);
             let slot = slot_index(self.last_tick_ms);
-            for entry in self.slots[slot].drain(..) {
-                if let Some((key, field)) = entry {
-                    expired.push((key, field));
-                }
+            for (key, field) in self.slots[slot].drain(..).flatten() {
+                expired.push((key, field));
             }
             if slot == WHEEL_SLOTS - 1 {
                 self.rotations = self.rotations.saturating_add(1);
@@ -194,10 +192,8 @@ impl FieldExpiryWheel {
 }
 
 fn drain_slot(slot: &mut WheelSlot, expired: &mut Vec<CompactString>) {
-    for entry in slot.drain(..) {
-        if let Some(key) = entry {
-            expired.push(key);
-        }
+    for key in slot.drain(..).flatten() {
+        expired.push(key);
     }
 }
 

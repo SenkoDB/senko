@@ -818,12 +818,12 @@ impl ShardChannelRouter {
     pub fn standalone() -> Self {
         Self {
             cluster_mode: false,
-            slot_to_shard: vec![0; SLOT_COUNT as usize].into_boxed_slice(),
+            slot_to_shard: vec![0; SLOT_COUNT].into_boxed_slice(),
         }
     }
 
     pub fn cluster_by_modulo(num_shards: usize) -> Self {
-        let slot_to_shard = (0..SLOT_COUNT as usize)
+        let slot_to_shard = (0..SLOT_COUNT)
             .map(|slot| slot % num_shards.max(1))
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -1223,13 +1223,13 @@ mod tests {
         }
         flush_bus(&mut shards);
 
-        for publisher in 0..PUBLISHERS {
+        for (publisher, shard) in shards.iter_mut().enumerate().take(PUBLISHERS) {
             for channel_index in 0..CHANNELS {
                 let channel = format!("chan:{channel_index}");
                 for sequence in 0..MESSAGES_PER_PUBLISHER {
                     let payload = format!("{publisher}:{sequence}");
-                    let outcome = shards[publisher]
-                        .publish(channel.as_bytes(), Bytes::from(payload.into_bytes()));
+                    let outcome =
+                        shard.publish(channel.as_bytes(), Bytes::from(payload.into_bytes()));
                     assert_eq!(outcome.delivered, SUBSCRIBERS_PER_CHANNEL as u64);
                     assert!(!outcome.cache_miss);
                 }

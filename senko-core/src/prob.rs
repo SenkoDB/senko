@@ -243,6 +243,7 @@ impl BloomFilter {
         true
     }
 
+    #[allow(clippy::result_unit_err)]
     pub fn add(&mut self, item: &[u8]) -> Result<bool, ()> {
         if !self.ensure_capacity() {
             return Err(());
@@ -370,6 +371,7 @@ impl CuckooLayer {
         self.buckets[i1].contains(fp) || self.buckets[i2].contains(fp)
     }
 
+    #[allow(clippy::result_unit_err)]
     pub fn insert(&mut self, item: &[u8]) -> Result<(), ()> {
         let fp = self.fingerprint(item);
         let (i1, i2) = self.positions(item, fp);
@@ -441,6 +443,7 @@ impl CuckooFilter {
         self.layers.iter().rev().any(|layer| layer.contains(item))
     }
 
+    #[allow(clippy::result_unit_err)]
     pub fn add(&mut self, item: &[u8]) -> Result<(), ()> {
         match self.layers.last_mut().expect("layer").insert(item) {
             Ok(()) => {
@@ -462,6 +465,7 @@ impl CuckooFilter {
         }
     }
 
+    #[allow(clippy::result_unit_err)]
     pub fn add_nx(&mut self, item: &[u8]) -> Result<bool, ()> {
         if self.exists(item) {
             return Ok(false);

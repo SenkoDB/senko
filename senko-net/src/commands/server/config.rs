@@ -130,7 +130,7 @@ fn config_set(args: &[Frame<'_>]) -> Result<ConfigCommandOutcome, Vec<u8>> {
         validate_maxmemory_policy as fn(&str) -> Result<(), ()>,
         validate_loglevel as fn(&str) -> Result<(), ()>,
     );
-    if args.is_empty() || args.len() % 2 != 0 {
+    if args.is_empty() || !args.len().is_multiple_of(2) {
         return Err(error_message(
             "ERR wrong number of arguments for 'config|set' command",
         ));

@@ -474,6 +474,7 @@ fn doc_argument_response(argument: &DocArgument) -> Response {
     ]))
 }
 
+#[allow(clippy::type_complexity)]
 fn extract_keys(
     meta: &CommandMeta,
     args: &[Frame<'_>],

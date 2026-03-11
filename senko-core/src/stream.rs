@@ -497,8 +497,13 @@ pub struct RadixNode {
     pub value: Option<Box<ListpackMacroNode>>,
 }
 
+pub type StreamFieldPairOwned = (Vec<u8>, Vec<u8>);
+pub type StreamOwnedEntry = (StreamId, Vec<StreamFieldPairOwned>);
+pub type StreamFieldPairBorrowed<'a> = (&'a [u8], &'a [u8]);
+pub type StreamBorrowedEntry<'a> = (StreamId, Vec<StreamFieldPairBorrowed<'a>>);
+
 pub struct StreamRangeIter<'a> {
-    items: Vec<(StreamId, Vec<(Vec<u8>, Vec<u8>)>)>,
+    items: Vec<StreamOwnedEntry>,
     index: usize,
     _marker: PhantomData<&'a ()>,
 }
@@ -566,11 +571,11 @@ impl StreamRadixTree {
         }
 
         let mut appended = false;
-        if let Some((_, tail)) = self.nodes.iter_mut().next_back() {
-            if !tail.is_full(100, 4096) {
-                tail.append_with_mode(id, fields, ref_mode);
-                appended = true;
-            }
+        if let Some((_, tail)) = self.nodes.iter_mut().next_back()
+            && !tail.is_full(100, 4096)
+        {
+            tail.append_with_mode(id, fields, ref_mode);
+            appended = true;
         }
 
         if !appended {
@@ -826,11 +831,11 @@ impl StreamRadixTree {
         self.refresh_edge_ids();
     }
 
-    pub fn first_entry(&self) -> Option<(StreamId, Vec<(&[u8], &[u8])>)> {
+    pub fn first_entry(&self) -> Option<StreamBorrowedEntry<'_>> {
         self.nodes.values().find_map(|node| node.iter().next())
     }
 
-    pub fn last_entry(&self) -> Option<(StreamId, Vec<(&[u8], &[u8])>)> {
+    pub fn last_entry(&self) -> Option<StreamBorrowedEntry<'_>> {
         for node in self.nodes.values().rev() {
             let mut last = None;
             for entry in node.iter() {

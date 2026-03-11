@@ -76,6 +76,7 @@ struct InnerNode {
 }
 
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 enum Node {
     Leaf(LeafNode),
     Inner(InnerNode),
@@ -815,7 +816,7 @@ struct ScoreSearchHit {
 }
 
 impl ScoreSearchHit {
-    fn score<'a>(&self, tree: &'a BPTree) -> f64 {
+    fn score(&self, tree: &BPTree) -> f64 {
         tree.leaf(self.leaf_id).entries[self.index].score
     }
 

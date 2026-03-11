@@ -282,7 +282,7 @@ fn bf_reserve(ctx: &mut dyn ModuleCommandContext, args: &[&[u8]]) -> ModuleResul
     while index < args.len() {
         if args[index].eq_ignore_ascii_case(b"EXPANSION") {
             expansion =
-                parse_u64(*args.get(index + 1).ok_or_else(|| err(ProbError::Syntax))?)? as u8;
+                parse_u64(args.get(index + 1).ok_or_else(|| err(ProbError::Syntax))?)? as u8;
             index += 2;
         } else if args[index].eq_ignore_ascii_case(b"NONSCALING") {
             non_scaling = true;
@@ -344,17 +344,17 @@ fn bf_insert(ctx: &mut dyn ModuleCommandContext, args: &[&[u8]]) -> ModuleResult
     while index < args.len() && !args[index].eq_ignore_ascii_case(b"ITEMS") {
         match args[index] {
             token if token.eq_ignore_ascii_case(b"CAPACITY") => {
-                capacity = parse_u64(*args.get(index + 1).ok_or_else(|| err(ProbError::Syntax))?)?;
+                capacity = parse_u64(args.get(index + 1).ok_or_else(|| err(ProbError::Syntax))?)?;
                 index += 2;
             }
             token if token.eq_ignore_ascii_case(b"ERROR") => {
                 error_rate =
-                    parse_f64(*args.get(index + 1).ok_or_else(|| err(ProbError::Syntax))?)?;
+                    parse_f64(args.get(index + 1).ok_or_else(|| err(ProbError::Syntax))?)?;
                 index += 2;
             }
             token if token.eq_ignore_ascii_case(b"EXPANSION") => {
                 expansion =
-                    parse_u64(*args.get(index + 1).ok_or_else(|| err(ProbError::Syntax))?)? as u8;
+                    parse_u64(args.get(index + 1).ok_or_else(|| err(ProbError::Syntax))?)? as u8;
                 index += 2;
             }
             token if token.eq_ignore_ascii_case(b"NOCREATE") => {
@@ -500,17 +500,17 @@ fn cf_reserve(ctx: &mut dyn ModuleCommandContext, args: &[&[u8]]) -> ModuleResul
         match args[index] {
             token if token.eq_ignore_ascii_case(b"BUCKETSIZE") => {
                 bucket_size =
-                    parse_usize(*args.get(index + 1).ok_or_else(|| err(ProbError::Syntax))?)?;
+                    parse_usize(args.get(index + 1).ok_or_else(|| err(ProbError::Syntax))?)?;
                 index += 2;
             }
             token if token.eq_ignore_ascii_case(b"MAXITERATIONS") => {
                 max_iterations =
-                    parse_usize(*args.get(index + 1).ok_or_else(|| err(ProbError::Syntax))?)?;
+                    parse_usize(args.get(index + 1).ok_or_else(|| err(ProbError::Syntax))?)?;
                 index += 2;
             }
             token if token.eq_ignore_ascii_case(b"EXPANSION") => {
                 expansion =
-                    parse_usize(*args.get(index + 1).ok_or_else(|| err(ProbError::Syntax))?)?;
+                    parse_usize(args.get(index + 1).ok_or_else(|| err(ProbError::Syntax))?)?;
                 index += 2;
             }
             _ => return Err(err(ProbError::Syntax)),
@@ -580,7 +580,7 @@ fn cf_insert_impl(ctx: &mut dyn ModuleCommandContext, args: &[&[u8]], nx: bool) 
         match args[index] {
             token if token.eq_ignore_ascii_case(b"CAPACITY") => {
                 capacity =
-                    parse_usize(*args.get(index + 1).ok_or_else(|| err(ProbError::Syntax))?)?;
+                    parse_usize(args.get(index + 1).ok_or_else(|| err(ProbError::Syntax))?)?;
                 index += 2;
             }
             token if token.eq_ignore_ascii_case(b"NOCREATE") => {
@@ -789,7 +789,7 @@ fn cms_initbyprob(ctx: &mut dyn ModuleCommandContext, args: &[&[u8]]) -> ModuleR
 }
 
 fn cms_incrby(ctx: &mut dyn ModuleCommandContext, args: &[&[u8]]) -> ModuleResult {
-    if args.len() < 3 || args.len() % 2 == 0 {
+    if args.len() < 3 || args.len().is_multiple_of(2) {
         return Err(err(ProbError::WrongArity));
     }
     let mut sketch = cms_mut(ctx, args[0], || CountMinSketch::new(2000, 5))?;
@@ -938,7 +938,7 @@ fn topk_add(ctx: &mut dyn ModuleCommandContext, args: &[&[u8]]) -> ModuleResult 
 }
 
 fn topk_incrby(ctx: &mut dyn ModuleCommandContext, args: &[&[u8]]) -> ModuleResult {
-    if args.len() < 3 || args.len() % 2 == 0 {
+    if args.len() < 3 || args.len().is_multiple_of(2) {
         return Err(err(ProbError::WrongArity));
     }
     let mut sketch = topk_mut(ctx, args[0], || {
@@ -1088,7 +1088,7 @@ fn tdigest_merge(ctx: &mut dyn ModuleCommandContext, args: &[&[u8]]) -> ModuleRe
         match args[index] {
             token if token.eq_ignore_ascii_case(b"COMPRESSION") => {
                 compression = Some(parse_f64(
-                    *args.get(index + 1).ok_or_else(|| err(ProbError::Syntax))?,
+                    args.get(index + 1).ok_or_else(|| err(ProbError::Syntax))?,
                 )?);
                 index += 2;
             }

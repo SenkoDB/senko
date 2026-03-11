@@ -43,8 +43,9 @@ pub use set::{
     lp_set_remove,
 };
 pub use stream::{
-    ConsumerGroup, ConsumerState, ListpackMacroNode, MacroNodeIter, PelEntry, RadixNode, StreamId,
-    StreamObject, StreamRadixTree, StreamRangeIter, StreamRefMode,
+    ConsumerGroup, ConsumerState, ListpackMacroNode, MacroNodeIter, PelEntry, RadixNode,
+    StreamBorrowedEntry, StreamFieldPairBorrowed, StreamFieldPairOwned, StreamId, StreamObject,
+    StreamOwnedEntry, StreamRadixTree, StreamRangeIter, StreamRefMode,
 };
 pub use value::{FeroxValue, SenkoValue};
 #[cfg(feature = "vector")]

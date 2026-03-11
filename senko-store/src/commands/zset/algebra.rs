@@ -87,7 +87,7 @@ pub fn zdiff(store: &mut Store, args: &[Frame<'_>]) -> SenkoResult<Response> {
         [frame] if arg_bytes(frame)?.eq_ignore_ascii_case(b"withscores") => true,
         _ => return Err(SenkoError::Protocol("ERR syntax error")),
     };
-    let sets = collect_zset_keys(store, &parsed.keys)?;
+    let sets = collect_zset_keys(store, parsed.keys)?;
     Ok(zset_entries_response(compute_zdiff(&sets), withscores))
 }
 
@@ -103,7 +103,7 @@ pub fn zdiffstore(store: &mut Store, args: &[Frame<'_>]) -> SenkoResult<Response
     if !parsed.tail.is_empty() {
         return Err(SenkoError::Protocol("ERR syntax error"));
     }
-    let sets = collect_zset_keys(store, &parsed.keys)?;
+    let sets = collect_zset_keys(store, parsed.keys)?;
     let result = compute_zdiff(&sets);
     Ok(Response::Integer(
         store_zset_result(store, destination, result) as i64,
@@ -145,7 +145,7 @@ pub fn zintercard(store: &mut Store, args: &[Frame<'_>]) -> SenkoResult<Response
         }
         _ => return Err(SenkoError::Protocol("ERR syntax error")),
     };
-    let sets = collect_zset_keys(store, &parsed.keys)?;
+    let sets = collect_zset_keys(store, parsed.keys)?;
     let result = compute_zintercard(&sets, limit.unwrap_or(0));
     Ok(Response::Integer(result as i64))
 }
@@ -165,7 +165,7 @@ where
         ))));
     }
     let parsed = parse_weighted_args(args, command)?;
-    let sets = collect_zset_keys(store, &parsed.keys)?;
+    let sets = collect_zset_keys(store, parsed.keys)?;
     let entries = compute(&sets, &parsed.weights, parsed.aggregate);
     Ok(zset_entries_response(entries, parsed.withscores))
 }
@@ -186,7 +186,7 @@ where
     }
     let destination = parse_compact(arg_bytes(&args[0])?);
     let parsed = parse_weighted_args(&args[1..], command)?;
-    let sets = collect_zset_keys(store, &parsed.keys)?;
+    let sets = collect_zset_keys(store, parsed.keys)?;
     let entries = compute(&sets, &parsed.weights, parsed.aggregate);
     Ok(Response::Integer(
         store_zset_result(store, destination, entries) as i64,
@@ -409,12 +409,10 @@ fn parse_numkey_sources<'a>(
     }
     let numkeys = numkeys as usize;
     if rest.len() < numkeys {
-        let msg = if store_variant {
-            "ERR numkeys does not match number of keys"
-        } else {
-            "ERR numkeys does not match number of keys"
-        };
-        return Err(SenkoError::ProtocolMessage(CompactString::new(msg)));
+        let _ = store_variant;
+        return Err(SenkoError::ProtocolMessage(CompactString::new(
+            "ERR numkeys does not match number of keys",
+        )));
     }
     Ok(ParsedNumKeys {
         keys: &rest[..numkeys],

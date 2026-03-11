@@ -301,11 +301,10 @@ pub fn assign_slots_to_shards(
 pub fn hash_tag(key: &[u8]) -> &[u8] {
     if let Some(open) = memchr(b'{', key) {
         let rest = &key[open + 1..];
-        if let Some(close) = memchr(b'}', rest) {
-            if close > 0 {
+        if let Some(close) = memchr(b'}', rest)
+            && close > 0 {
                 return &rest[..close];
             }
-        }
     }
     key
 }

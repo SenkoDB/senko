@@ -533,10 +533,7 @@ fn memory_doctor(aggregate: &info::AggregateSnapshotForDiagnostics) -> String {
             aggregate.used_memory, max_memory
         ));
     }
-    if aggregate.key_count > 10_000
-        && aggregate.key_count > 0
-        && aggregate.store_used_memory / aggregate.key_count < 128
-    {
+    if aggregate.key_count > 10_000 && aggregate.store_used_memory / aggregate.key_count < 128 {
         advice.push(
             "- Many small keys detected. Review encoding thresholds and key design.".to_owned(),
         );
@@ -566,7 +563,7 @@ fn latency_latest() -> SmallVec<[Response; 16]> {
             ])))
         })
         .collect::<Vec<_>>();
-    latest.sort_by(|left, right| response_array_ts(right).cmp(&response_array_ts(left)));
+    latest.sort_by_key(|entry| std::cmp::Reverse(response_array_ts(entry)));
     latest.into_iter().collect()
 }
 
@@ -916,7 +913,7 @@ fn current_unix_sec() -> u64 {
 mod tests {
     use senko_core::SenkoConfig;
 
-    use super::{GRAPH_HEIGHT, current_unix_sec, init, render_latency_graph, truncate_compact};
+    use super::{current_unix_sec, init, render_latency_graph, truncate_compact};
 
     fn ensure_state() {
         init(&SenkoConfig {
@@ -943,6 +940,5 @@ mod tests {
     fn current_unix_sec_is_reasonable() {
         ensure_state();
         assert!(current_unix_sec() > 1_000_000_000);
-        assert!(GRAPH_HEIGHT > 0);
     }
 }

@@ -122,24 +122,19 @@ async fn handle_client(
             .fetch_add(read.len() as u64, std::sync::atomic::Ordering::Relaxed);
         parse_buffer.extend_from_slice(&read);
         let mut consumed = 0usize;
-        loop {
-            match parser.parse(&parse_buffer[consumed..])? {
-                ParseStatus::Complete(frame, used) => {
-                    consumed += used;
-                    let result = dispatch(frame, &runtime, &mut client)?;
-                    runtime.borrow().stats.total_net_output_bytes.fetch_add(
-                        result.response.len() as u64,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    let BufResult(write, _) = stream.write_all(result.response.freeze()).await;
-                    write?;
-                    if result.close {
-                        let current = runtime.borrow().connected_clients;
-                        runtime.borrow_mut().connected_clients = current.saturating_sub(1);
-                        return Ok(());
-                    }
-                }
-                ParseStatus::Incomplete(_) => break,
+        while let ParseStatus::Complete(frame, used) = parser.parse(&parse_buffer[consumed..])? {
+            consumed += used;
+            let result = dispatch(frame, &runtime, &mut client)?;
+            runtime.borrow().stats.total_net_output_bytes.fetch_add(
+                result.response.len() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            let BufResult(write, _) = stream.write_all(result.response.freeze()).await;
+            write?;
+            if result.close {
+                let current = runtime.borrow().connected_clients;
+                runtime.borrow_mut().connected_clients = current.saturating_sub(1);
+                return Ok(());
             }
         }
         if consumed > 0 {

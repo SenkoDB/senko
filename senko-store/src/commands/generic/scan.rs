@@ -134,7 +134,7 @@ pub fn randomkey(store: &mut Store, args: &[Frame<'_>]) -> SenkoResult<Response>
         }
     }
 
-    for (key, _, _, _) in store.live_entries_snapshot(now_ms) {
+    if let Some((key, _, _, _)) = store.live_entries_snapshot(now_ms).into_iter().next() {
         let _ = store.touch(key.as_bytes());
         return Ok(Response::Value(Some(SenkoValue::Raw(
             Bytes::copy_from_slice(key.as_bytes()),
@@ -412,8 +412,8 @@ mod tests {
         let keys = key_array(keys(&mut store, &[bs(b"*")]).unwrap());
         let set: HashSet<_> = keys.into_iter().collect();
         assert_eq!(set.len(), 2);
-        assert!(set.contains(&b"a".to_vec()));
-        assert!(set.contains(&b"b".to_vec()));
+        assert!(set.contains(b"a".as_slice()));
+        assert!(set.contains(b"b".as_slice()));
     }
 
     #[test]
@@ -426,10 +426,10 @@ mod tests {
 
         let matched = key_array(keys(&mut store, &[bs(b"h?llo")]).unwrap());
         let set: HashSet<_> = matched.into_iter().collect();
-        assert!(set.contains(&b"hello".to_vec()));
-        assert!(set.contains(&b"hallo".to_vec()));
-        assert!(!set.contains(&b"hllo".to_vec()));
-        assert!(!set.contains(&b"heello".to_vec()));
+        assert!(set.contains(b"hello".as_slice()));
+        assert!(set.contains(b"hallo".as_slice()));
+        assert!(!set.contains(b"hllo".as_slice()));
+        assert!(!set.contains(b"heello".as_slice()));
 
         let mut empty = Store::default();
         assert!(key_array(keys(&mut empty, &[bs(b"*")]).unwrap()).is_empty());

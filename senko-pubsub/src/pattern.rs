@@ -266,11 +266,10 @@ pub fn glob_match_simd(pattern: &[u8], text: &[u8]) -> bool {
         return text.starts_with(&pattern[..prefix_len]);
     }
 
-    if let Some(segments) = literal_segments_for_prune(pattern, &features) {
-        if !segments_match_in_order(segments.as_slice(), text) {
+    if let Some(segments) = literal_segments_for_prune(pattern, &features)
+        && !segments_match_in_order(segments.as_slice(), text) {
             return false;
         }
-    }
 
     glob_match_scalar(pattern, text)
 }
@@ -429,11 +428,10 @@ fn literal_segments_for_prune<'a>(
                 index += (index + 1 < pattern.len()) as usize + 1;
             }
             b'*' | b'?' | b'[' => {
-                if let Some(start) = segment_start.take() {
-                    if index > start {
+                if let Some(start) = segment_start.take()
+                    && index > start {
                         segments.push(&pattern[start..index]);
                     }
-                }
                 index += if pattern[index] == b'[' {
                     char_class_token_len(pattern, index)
                 } else {

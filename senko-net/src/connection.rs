@@ -1,3 +1,9 @@
+#![allow(
+    clippy::arc_with_non_send_sync,
+    clippy::await_holding_lock,
+    clippy::too_many_arguments
+)]
+
 use std::{
     cell::RefCell,
     net::SocketAddr,

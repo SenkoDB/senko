@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};

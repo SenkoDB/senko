@@ -12,6 +12,7 @@ use crate::{
     zset::{LexBound, ScoreBound, parse_lex_bound, parse_score_bound},
 };
 
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum RangeSpec<'a> {
     ByRank {
         start: i64,

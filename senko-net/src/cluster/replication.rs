@@ -582,11 +582,10 @@ impl ShardReplication {
 
     pub fn append_command(&self, cmd_bytes: &[u8]) -> Result<u64, ReplError> {
         let offset = self.backlog.try_append(cmd_bytes)?;
-        if self.snapshot_in_progress.load(Ordering::Acquire) {
-            if let Ok(mut delta) = self.snapshot_delta.lock() {
+        if self.snapshot_in_progress.load(Ordering::Acquire)
+            && let Ok(mut delta) = self.snapshot_delta.lock() {
                 delta.push(ReplFrame::command(self.shard, offset, cmd_bytes.to_vec()));
             }
-        }
         Ok(offset)
     }
 
@@ -918,7 +917,7 @@ pub async fn read_repl_hello_ack(stream: &mut TcpStream) -> Result<ReplHelloAck,
     let BufResult(result, buffer) = stream
         .read_exact(Vec::with_capacity(REPL_HELLO_ACK_LEN))
         .await;
-    let _ = result?;
+    result?;
     ReplHelloAck::decode(&buffer)
 }
 
@@ -932,7 +931,7 @@ pub async fn read_repl_frame(stream: &mut TcpStream) -> Result<ReplFrame, ReplEr
     let BufResult(result, header) = stream
         .read_exact(Vec::with_capacity(REPL_FRAME_HEADER_LEN))
         .await;
-    let _ = result?;
+    result?;
     let mut cursor = Cursor::new(&header);
     let frame_type = ReplFrameType::decode(cursor.take_u8()?)?;
     let payload_len = cursor.take_u32()? as usize;
@@ -940,7 +939,7 @@ pub async fn read_repl_frame(stream: &mut TcpStream) -> Result<ReplFrame, ReplEr
     let offset = cursor.take_u64()?;
     cursor.finish()?;
     let BufResult(result, payload) = stream.read_exact(Vec::with_capacity(payload_len)).await;
-    let _ = result?;
+    result?;
     Ok(ReplFrame {
         frame_type,
         shard,

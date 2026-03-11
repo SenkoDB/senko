@@ -769,7 +769,7 @@ fn setrange_cases_from_redis_suite() {
     );
     assert_eq!(
         bytes_of(basic::get(&mut store, &[bs(b"myint")]).unwrap()),
-        Some(b"1234\02".to_vec())
+        Some(b"1234\x02".to_vec())
     );
 
     assert!(strops::setrange(&mut store, &[bs(b"mykey"), bs(b"-1"), bs(b"world")]).is_err());

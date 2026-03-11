@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use std::{
     cell::RefCell,
     fmt::Write as _,
@@ -746,10 +748,10 @@ fn parse_info_sections(args: &[Frame<'_>]) -> Result<Vec<InfoSection>, Vec<u8>> 
             extend_unique(&mut out, &all_sections());
             continue;
         }
-        if let Some(section) = parse_info_section(token) {
-            if !out.contains(&section) {
-                out.push(section);
-            }
+        if let Some(section) = parse_info_section(token)
+            && !out.contains(&section)
+        {
+            out.push(section);
         }
     }
     Ok(out)
@@ -1477,7 +1479,7 @@ fn render_info(
 fn write_stats_section(
     out: &mut String,
     aggregate: &AggregateSnapshot,
-    include_connected: bool,
+    _include_connected: bool,
     config: &SenkoConfig,
 ) {
     let _ = write!(
@@ -1524,11 +1526,7 @@ fn write_stats_section(
             "total_blocking_keys:{}\r\n",
             "total_blocking_keys_on_nokey:0\r\n"
         ),
-        if include_connected {
-            aggregate.connected_clients
-        } else {
-            aggregate.connected_clients
-        },
+        aggregate.connected_clients,
         config.max_connections,
         aggregate.recent_max_input_buffer,
         aggregate.recent_max_output_buffer,

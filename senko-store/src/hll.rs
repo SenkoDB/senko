@@ -508,7 +508,7 @@ mod tests {
         let _ = hll.add(b"foo");
         let dirty = hll.to_bytes();
         assert_eq!(dirty[15] & 0x80, 0x80);
-        assert_eq!(dirty.len() >= HLL_HDR_SIZE, true);
+        assert!(dirty.len() >= HLL_HDR_SIZE);
     }
 
     #[test]

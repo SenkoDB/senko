@@ -41,7 +41,7 @@ fn parse_hscan(response: Response) -> (u64, Vec<Vec<u8>>) {
 }
 
 fn collect_all(
-    mut store: &mut Store,
+    store: &mut Store,
     key: &[u8],
     pattern: Option<&[u8]>,
     count: usize,
@@ -63,7 +63,7 @@ fn collect_all(
         if novalues {
             args.push(bs(b"NOVALUES"));
         }
-        let (next, page) = parse_hscan(scan::hscan(&mut store, &args).unwrap());
+        let (next, page) = parse_hscan(scan::hscan(store, &args).unwrap());
         out.extend(page);
         cursor = next;
         if cursor == 0 {

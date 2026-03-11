@@ -362,6 +362,7 @@ mod tests {
         Frame::BulkString(bytes)
     }
 
+    #[allow(clippy::type_complexity)]
     fn setup() -> (
         Rc<RefCell<Store>>,
         Rc<RefCell<WatchRegistry>>,

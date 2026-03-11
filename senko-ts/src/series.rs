@@ -139,6 +139,7 @@ impl TimeSeries {
         samples
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn aggregate(
         &self,
         samples: &[(i64, f64)],
@@ -437,6 +438,23 @@ impl Default for TsModule {
 
 pub type SharedTimeSeries = Arc<RwLock<TimeSeries>>;
 
+fn align_bucket(timestamp: i64, bucket_duration: i64, align_ts: i64) -> i64 {
+    if bucket_duration <= 0 {
+        return timestamp;
+    }
+    let delta = timestamp.saturating_sub(align_ts);
+    let offset = delta.rem_euclid(bucket_duration);
+    timestamp.saturating_sub(offset)
+}
+
+fn bucket_ts(start: i64, end: i64, bucket_timestamp: BucketTimestamp) -> i64 {
+    match bucket_timestamp {
+        BucketTimestamp::Start => start,
+        BucketTimestamp::End => end.saturating_sub(1),
+        BucketTimestamp::Mid => start.saturating_add((end.saturating_sub(start)) / 2),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{BucketTimestamp, DupPolicy, Encoding, IgnoreConfig, TimeSeries};
@@ -501,22 +519,5 @@ mod tests {
             39,
         );
         assert_eq!(aggregated, vec![(0, 2.0), (20, 6.0)]);
-    }
-}
-
-fn align_bucket(timestamp: i64, bucket_duration: i64, align_ts: i64) -> i64 {
-    if bucket_duration <= 0 {
-        return timestamp;
-    }
-    let delta = timestamp.saturating_sub(align_ts);
-    let offset = delta.rem_euclid(bucket_duration);
-    timestamp.saturating_sub(offset)
-}
-
-fn bucket_ts(start: i64, end: i64, bucket_timestamp: BucketTimestamp) -> i64 {
-    match bucket_timestamp {
-        BucketTimestamp::Start => start,
-        BucketTimestamp::End => end.saturating_sub(1),
-        BucketTimestamp::Mid => start.saturating_add((end.saturating_sub(start)) / 2),
     }
 }

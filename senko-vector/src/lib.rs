@@ -118,7 +118,7 @@ fn vadd(ctx: &mut dyn ModuleCommandContext, args: &[&[u8]]) -> ModuleResult {
     let mut reduce = None;
     if eq_ascii(args[index], b"REDUCE") {
         index += 1;
-        reduce = Some(parse_usize(*args.get(index).ok_or_else(|| {
+        reduce = Some(parse_usize(args.get(index).ok_or_else(|| {
             err("ERR REDUCE dimension must be less than input dimension")
         })?)?);
         index += 1;
@@ -126,8 +126,7 @@ fn vadd(ctx: &mut dyn ModuleCommandContext, args: &[&[u8]]) -> ModuleResult {
     let (input, consumed) = parse_input_vector(&args[index..])?;
     index += consumed;
     let element = Bytes::copy_from_slice(
-        *args
-            .get(index)
+        args.get(index)
             .ok_or_else(|| err("ERR Element not found"))?,
     );
     index += 1;
@@ -149,13 +148,12 @@ fn vadd(ctx: &mut dyn ModuleCommandContext, args: &[&[u8]]) -> ModuleResult {
             index += 1;
         } else if eq_ascii(args[index], b"SETATTR") {
             index += 1;
-            attrs = Some(parse_attrs(*args.get(index).ok_or(VectorError::BadAttrs)?)?);
+            attrs = Some(parse_attrs(args.get(index).ok_or(VectorError::BadAttrs)?)?);
             index += 1;
         } else if eq_ascii(args[index], b"M") {
             index += 1;
             m = parse_usize(
-                *args
-                    .get(index)
+                args.get(index)
                     .ok_or_else(|| err("ERR wrong number of arguments for 'vadd' command"))?,
             )?;
             index += 1;
@@ -260,7 +258,7 @@ fn vsim(ctx: &mut dyn ModuleCommandContext, args: &[&[u8]]) -> ModuleResult {
     let query = if eq_ascii(args[index], b"ELE") {
         index += 1;
         Query::Element(Bytes::copy_from_slice(
-            *args.get(index).ok_or(VectorError::NotFound)?,
+            args.get(index).ok_or(VectorError::NotFound)?,
         ))
     } else {
         let (input, consumed) = parse_input_vector(&args[index..])?;
@@ -285,12 +283,12 @@ fn vsim(ctx: &mut dyn ModuleCommandContext, args: &[&[u8]]) -> ModuleResult {
             index += 1;
         } else if eq_ascii(args[index], b"COUNT") {
             index += 1;
-            count = parse_usize(*args.get(index).ok_or_else(|| err("ERR syntax error"))?)?;
+            count = parse_usize(args.get(index).ok_or_else(|| err("ERR syntax error"))?)?;
             index += 1;
         } else if eq_ascii(args[index], b"EPSILON") {
             index += 1;
             epsilon = Some(parse_f32(
-                *args.get(index).ok_or_else(|| err("ERR syntax error"))?,
+                args.get(index).ok_or_else(|| err("ERR syntax error"))?,
             )?);
             index += 1;
         } else if eq_ascii(args[index], b"EF") || eq_ascii(args[index], b"FILTER-EF") {
@@ -298,7 +296,7 @@ fn vsim(ctx: &mut dyn ModuleCommandContext, args: &[&[u8]]) -> ModuleResult {
         } else if eq_ascii(args[index], b"FILTER") {
             index += 1;
             filter = Some(parse_filter(
-                *args.get(index).ok_or(VectorError::BadFilter)?,
+                args.get(index).ok_or(VectorError::BadFilter)?,
             )?);
             index += 1;
         } else if eq_ascii(args[index], b"TRUTH") {
@@ -691,7 +689,7 @@ fn parse_input_vector(args: &[&[u8]]) -> Result<(Vec<f32>, usize), ModuleError> 
         return Ok((out, 2));
     }
     if eq_ascii(args[0], b"VALUES") {
-        let count = parse_usize(*args.get(1).ok_or(VectorError::BadValuesCount)?)?;
+        let count = parse_usize(args.get(1).ok_or(VectorError::BadValuesCount)?)?;
         if args.len() < count + 2 {
             return Err(VectorError::BadValuesCount.into());
         }
@@ -746,8 +744,8 @@ fn project_if_needed(vset: &VectorSet, input: &[f32]) -> Result<Vec<f32>, Module
         }
         let mut output = vec![0.0_f32; proj.output_dim];
         for (row, input_value) in input.iter().enumerate() {
-            for col in 0..proj.output_dim {
-                output[col] += input_value * proj.matrix[row * proj.output_dim + col];
+            for (col, out) in output.iter_mut().enumerate().take(proj.output_dim) {
+                *out += input_value * proj.matrix[row * proj.output_dim + col];
             }
         }
         Ok(output)

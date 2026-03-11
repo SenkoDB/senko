@@ -258,6 +258,7 @@ fn apply_expiry_to_fields(
     Ok(Response::Array(Box::new(out)))
 }
 
+#[allow(clippy::type_complexity)]
 fn parse_expire_args<'a>(
     frames: &'a [Frame<'_>],
     command: &'static str,

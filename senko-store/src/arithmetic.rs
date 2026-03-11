@@ -111,15 +111,14 @@ pub fn format_f64_no_scientific(value: f64) -> Vec<u8> {
     let decimal_pos = digits.len() as i32 - frac_digits as i32 + exponent;
     if decimal_pos <= 0 {
         out.extend_from_slice(b"0.");
-        for _ in 0..(-decimal_pos) {
-            out.push(b'0');
-        }
+        out.extend(std::iter::repeat_n(b'0', (-decimal_pos) as usize));
         out.extend_from_slice(&digits);
     } else if decimal_pos as usize >= digits.len() {
         out.extend_from_slice(&digits);
-        for _ in 0..(decimal_pos as usize - digits.len()) {
-            out.push(b'0');
-        }
+        out.extend(std::iter::repeat_n(
+            b'0',
+            decimal_pos as usize - digits.len(),
+        ));
     } else {
         let split = decimal_pos as usize;
         out.extend_from_slice(&digits[..split]);
@@ -217,11 +216,11 @@ fn all_digits_swar(digits: &[u8]) -> bool {
 fn parse_i64_fallback(input: &[u8]) -> Option<i64> {
     let text = std::str::from_utf8(input).ok()?;
     if let Some(rest) = text.strip_prefix('-') {
-        let mag = i64::from_str_radix(rest, 10).ok()?;
+        let mag = rest.parse::<i64>().ok()?;
         mag.checked_neg()
     } else if let Some(rest) = text.strip_prefix('+') {
-        i64::from_str_radix(rest, 10).ok()
+        rest.parse::<i64>().ok()
     } else {
-        i64::from_str_radix(text, 10).ok()
+        text.parse::<i64>().ok()
     }
 }

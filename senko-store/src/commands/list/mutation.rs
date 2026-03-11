@@ -181,13 +181,12 @@ fn move_one(
         Some(SenkoValue::List(_)) => {}
         Some(other) => return Err(wrong_type(other)),
     }
-    if source != destination {
-        if let Some(value) = store.get(destination)
+    if source != destination
+        && let Some(value) = store.get(destination)
             && !matches!(value, SenkoValue::List(_))
         {
             return Err(wrong_type(value));
         }
-    }
 
     let moved = if source == destination {
         let list = store

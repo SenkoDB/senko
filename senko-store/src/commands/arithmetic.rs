@@ -68,7 +68,7 @@ pub fn incrbyfloat(store: &mut Store, args: &[Frame<'_>]) -> SenkoResult<Respons
     }
 
     let key = arg_bytes(&args[0])?;
-    let increment = parse_f64(arg_bytes(&args[1])?).ok_or_else(|| float_value_error())?;
+    let increment = parse_f64(arg_bytes(&args[1])?).ok_or_else(float_value_error)?;
     if !increment.is_finite() {
         return Err(float_nan_inf_error());
     }

@@ -102,46 +102,32 @@ pub enum FailoverState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Default)]
 pub enum Role {
     Master,
     Slave,
+    #[default]
     Unknown,
 }
 
-impl Default for Role {
-    fn default() -> Self {
-        Self::Unknown
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Default)]
 pub enum LinkStatus {
     Ok,
+    #[default]
     Err,
 }
 
-impl Default for LinkStatus {
-    fn default() -> Self {
-        Self::Err
-    }
-}
 
 #[derive(Clone, Debug)]
+#[derive(Default)]
 pub struct TiltState {
     pub tilt_start_time: u64,
     pub tilt_mode: bool,
     pub previous_time: u64,
 }
 
-impl Default for TiltState {
-    fn default() -> Self {
-        Self {
-            tilt_start_time: 0,
-            tilt_mode: false,
-            previous_time: 0,
-        }
-    }
-}
 
 impl TiltState {
     pub fn observe(&mut self, now: u64) -> Option<bool> {
@@ -151,7 +137,7 @@ impl TiltState {
             return None;
         }
         let delta = now as i128 - previous as i128;
-        if delta < 0 || delta > 2_000 {
+        if !(0..=2_000).contains(&delta) {
             if !self.tilt_mode {
                 self.tilt_mode = true;
                 self.tilt_start_time = now;

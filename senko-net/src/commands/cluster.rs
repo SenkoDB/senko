@@ -973,7 +973,7 @@ fn cluster_slots_range(
     cluster: &Rc<RefCell<ClusterCommandState>>,
     add: bool,
 ) -> Result<ClusterCommandOutcome, Vec<u8>> {
-    if args.is_empty() || args.len() % 2 != 0 {
+    if args.is_empty() || !args.len().is_multiple_of(2) {
         return Err(error_message("ERR syntax error"));
     }
 
@@ -1006,7 +1006,7 @@ fn cluster_slots(
         .iter()
         .map(|frame| {
             parse_slot(frame_bytes(frame).map_err(|error| error_bytes(&error))?)
-                .map_err(|message| error_message_text_vec(message))
+                .map_err(error_message_text_vec)
         })
         .collect::<Result<Vec<_>, _>>()?;
     update_local_slots(cluster, &slots, add)?;

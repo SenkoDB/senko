@@ -434,7 +434,7 @@ fn parse_geoadd_args<'a>(args: &'a [Frame<'a>]) -> SenkoResult<ParsedGeoAdd<'a>>
     }
 
     let remaining = &args[index..];
-    if remaining.len() < 3 || remaining.len() % 3 != 0 {
+    if remaining.len() < 3 || !remaining.len().is_multiple_of(3) {
         return Err(SenkoError::Protocol(
             "wrong number of arguments for 'geoadd' command",
         ));

@@ -25,8 +25,8 @@ pub fn zadd(store: &mut Store, args: &[Frame<'_>]) -> SenkoResult<Response> {
 
     let parsed = parse_zadd_args(&args[1..])?;
     if parsed.incr {
-        let score = parse_score_arg(arg_bytes(&parsed.pairs[0].0)?)?;
-        let member = parse_compact(arg_bytes(&parsed.pairs[0].1)?);
+        let score = parse_score_arg(arg_bytes(parsed.pairs[0].0)?)?;
+        let member = parse_compact(arg_bytes(parsed.pairs[0].1)?);
         let existing = store
             .get_zset(key)
             .and_then(|zset| zset.score(member.as_bytes()));
@@ -397,7 +397,7 @@ fn parse_zadd_args<'a>(args: &'a [Frame<'a>]) -> SenkoResult<ParsedZAddArgs<'a>>
     }
 
     let remaining = &args[index..];
-    if remaining.len() < 2 || remaining.len() % 2 != 0 {
+    if remaining.len() < 2 || !remaining.len().is_multiple_of(2) {
         return Err(SenkoError::Protocol(
             "wrong number of arguments for 'zadd' command",
         ));

@@ -2,7 +2,10 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use compact_str::CompactString;
-use senko_core::{ConsumerGroup, SenkoError, SenkoResult, SenkoValue, StreamId, StreamObject};
+use senko_core::{
+    ConsumerGroup, SenkoError, SenkoResult, SenkoValue, StreamFieldPairOwned, StreamId,
+    StreamObject, StreamOwnedEntry,
+};
 use senko_proto::Frame;
 use smallvec::{SmallVec, smallvec};
 
@@ -38,12 +41,14 @@ pub struct XReadGroupBlockSpec {
     pub timeout_response: BlockingResponseKind,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum BlockingCommandResult {
     Immediate(Response),
     Block(XReadBlockSpec),
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum GroupBlockingCommandResult {
     Immediate(Response),
@@ -176,7 +181,7 @@ fn deliver_new_entries(
     count: Option<usize>,
     noack: bool,
     claim_idle_ms: Option<u64>,
-) -> SenkoResult<Vec<(StreamId, Vec<(Vec<u8>, Vec<u8>)>)>> {
+) -> SenkoResult<Vec<StreamOwnedEntry>> {
     let now = now_ms();
     let mut out = Vec::new();
     let limit = count.unwrap_or(usize::MAX);
@@ -247,7 +252,6 @@ fn deliver_new_entries(
         .range(group.last_delivered_id, StreamId::MAX, None)
         .filter(|(id, _)| *id > group.last_delivered_id)
         .take(limit - out.len())
-        .map(|(id, fields)| (id, fields))
         .collect::<Vec<_>>();
 
     if entries.is_empty() {
@@ -277,7 +281,7 @@ fn redeliver_pending_entries(
     consumer: &CompactString,
     requested_id: StreamId,
     count: Option<usize>,
-) -> SenkoResult<Vec<(StreamId, Vec<(Vec<u8>, Vec<u8>)>)>> {
+) -> SenkoResult<Vec<StreamOwnedEntry>> {
     let Some(state) = group.consumers.get_mut(consumer.as_str()) else {
         return Ok(Vec::new());
     };
@@ -309,28 +313,24 @@ fn collect_entries(
     stream: &StreamObject,
     after_id: StreamId,
     count: Option<usize>,
-) -> Vec<(StreamId, Vec<(Vec<u8>, Vec<u8>)>)> {
+) -> Vec<StreamOwnedEntry> {
     let limit = count.unwrap_or(usize::MAX);
     stream
         .tree
         .range(after_id, StreamId::MAX, None)
         .filter(|(id, _)| *id > after_id)
         .take(limit)
-        .map(|(id, fields)| (id, fields))
         .collect()
 }
 
-fn materialize_fields(fields: Vec<(&[u8], &[u8])>) -> Vec<(Vec<u8>, Vec<u8>)> {
+fn materialize_fields(fields: Vec<(&[u8], &[u8])>) -> Vec<StreamFieldPairOwned> {
     fields
         .into_iter()
         .map(|(field, value)| (field.to_vec(), value.to_vec()))
         .collect()
 }
 
-fn stream_response(
-    key: &CompactString,
-    entries: Vec<(StreamId, Vec<(Vec<u8>, Vec<u8>)>)>,
-) -> Response {
+fn stream_response(key: &CompactString, entries: Vec<StreamOwnedEntry>) -> Response {
     let mut values = SmallVec::<[Response; 16]>::new();
     for (id, fields) in entries {
         let mut flat = SmallVec::<[Response; 16]>::new();
@@ -397,7 +397,7 @@ fn parse_xread_args(
     }
 
     let remaining = &args[index..];
-    if remaining.len() < 2 || remaining.len() % 2 != 0 {
+    if remaining.len() < 2 || !remaining.len().is_multiple_of(2) {
         return Err(SenkoError::Protocol(UNBALANCED_XREAD));
     }
     let half = remaining.len() / 2;
@@ -501,7 +501,7 @@ fn parse_xreadgroup_args(store: &mut Store, args: &[Frame<'_>]) -> SenkoResult<P
     }
     index += 1;
     let remaining = &args[index..];
-    if remaining.len() < 2 || remaining.len() % 2 != 0 {
+    if remaining.len() < 2 || !remaining.len().is_multiple_of(2) {
         return Err(SenkoError::Protocol(UNBALANCED_XREAD));
     }
     let half = remaining.len() / 2;

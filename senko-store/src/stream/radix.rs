@@ -5,6 +5,9 @@ use smallvec::SmallVec;
 use crate::stream::{id::StreamId, macro_node::ListpackMacroNode};
 use senko_core::SenkoError;
 
+type StreamOwnedEntry = (StreamId, Vec<(Vec<u8>, Vec<u8>)>);
+type StreamBorrowedEntry<'a> = (StreamId, Vec<(&'a [u8], &'a [u8])>);
+
 pub struct NodeArena<T> {
     _phantom: PhantomData<T>,
 }
@@ -31,7 +34,7 @@ pub struct RadixNode {
 }
 
 pub struct StreamRangeIter<'a> {
-    items: Vec<(StreamId, Vec<(Vec<u8>, Vec<u8>)>)>,
+    items: Vec<StreamOwnedEntry>,
     index: usize,
     _marker: PhantomData<&'a ()>,
 }
@@ -70,11 +73,11 @@ impl StreamRadixTree {
         }
 
         let mut appended = false;
-        if let Some((_, tail)) = self.nodes.iter_mut().next_back() {
-            if !tail.is_full(100, 4096) {
-                tail.append(id, fields);
-                appended = true;
-            }
+        if let Some((_, tail)) = self.nodes.iter_mut().next_back()
+            && !tail.is_full(100, 4096)
+        {
+            tail.append(id, fields);
+            appended = true;
         }
 
         if !appended {
@@ -299,23 +302,22 @@ impl StreamRadixTree {
             evicted += removed;
         }
 
-        if !approx {
-            if let Some((&node_key, _)) = self.nodes.first_key_value() {
-                if limit == 0 || evicted < limit {
-                    let room = if limit == 0 {
-                        usize::MAX
-                    } else {
-                        limit - evicted
-                    };
-                    self.trim_id_lt_from_node(node_key, min_id, room);
-                }
-            }
+        if !approx
+            && let Some((&node_key, _)) = self.nodes.first_key_value()
+            && (limit == 0 || evicted < limit)
+        {
+            let room = if limit == 0 {
+                usize::MAX
+            } else {
+                limit - evicted
+            };
+            self.trim_id_lt_from_node(node_key, min_id, room);
         }
 
         self.refresh_edge_ids();
     }
 
-    pub fn first_entry(&self) -> Option<(StreamId, Vec<(&[u8], &[u8])>)> {
+    pub fn first_entry(&self) -> Option<StreamBorrowedEntry<'_>> {
         for node in self.nodes.values() {
             if let Some(item) = node.iter().next() {
                 return Some(item);
@@ -324,7 +326,7 @@ impl StreamRadixTree {
         None
     }
 
-    pub fn last_entry(&self) -> Option<(StreamId, Vec<(&[u8], &[u8])>)> {
+    pub fn last_entry(&self) -> Option<StreamBorrowedEntry<'_>> {
         for node in self.nodes.values().rev() {
             let mut last = None;
             for item in node.iter() {

@@ -300,7 +300,6 @@ impl ZSetObject {
         };
         let mut entries: Vec<(f64, CompactString)> = match &self.inner {
             ZSetEncoding::Listpack(node) => lp_zset_range_by_rank(node, start as u64, stop as u64)
-                .map(|(score, member)| (score, member))
                 .collect(),
             ZSetEncoding::BPTree { tree, .. } => {
                 tree.range_by_rank(start as u64, stop as u64).collect()
@@ -321,7 +320,6 @@ impl ZSetObject {
     ) -> ZSetRangeIter<'_> {
         let mut entries: Vec<(f64, CompactString)> = match &self.inner {
             ZSetEncoding::Listpack(node) => lp_zset_range_by_score(node, min, max)
-                .map(|(score, member)| (score, member))
                 .collect(),
             ZSetEncoding::BPTree { tree, .. } => tree.range_by_score(min, max).collect(),
         };

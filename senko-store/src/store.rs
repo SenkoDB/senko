@@ -227,11 +227,10 @@ impl Store {
                 lru_clock(clock_snapshot)
             };
 
-            if !expired {
-                if !self.no_touch && entry.lru_clock.get() != now_lru {
+            if !expired
+                && !self.no_touch && entry.lru_clock.get() != now_lru {
                     entry.lru_clock.set(now_lru);
                 }
-            }
         }
         if expired {
             let _ = self.remove_entry(key);
@@ -547,8 +546,8 @@ impl Store {
         self.resize = None;
         self.global_version = 0;
         self.per_key_version.clear();
-        self.expiry_wheel = Box::new(TimerWheel::new(self.clock_ms));
-        self.field_expiry_wheel = Box::new(FieldExpiryWheel::new(self.clock_ms));
+        *self.expiry_wheel = TimerWheel::new(self.clock_ms);
+        *self.field_expiry_wheel = FieldExpiryWheel::new(self.clock_ms);
         self.memory = MemoryAccountant::default();
     }
 

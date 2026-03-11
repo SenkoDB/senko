@@ -528,7 +528,7 @@ mod tests {
             Response::Simple(b"OK")
         );
 
-        assert!(matches!(store.get(b"k0"), Some(_)));
-        assert!(matches!(store.get(b"k9999"), Some(_)));
+        assert!(store.get(b"k0").is_some());
+        assert!(store.get(b"k9999").is_some());
     }
 }

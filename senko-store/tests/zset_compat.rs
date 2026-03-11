@@ -2831,12 +2831,12 @@ fn run_stressers(conn: &mut Connection, mode: EncodingMode) {
                 .unwrap();
         }
         assert_encoding_any(conn, mode.expected_encodings(), "zscoretest");
-        for i in 0..elements {
+        for (i, expected) in aux.iter().enumerate().take(elements) {
             let got: f64 = zscore(conn, "zscoretest", &i.to_string())
                 .unwrap()
                 .parse()
                 .unwrap();
-            assert_eq!(got, aux[i]);
+            assert_eq!(got, *expected);
         }
 
         let mut auxarray = HashMap::<String, f64>::new();
@@ -4021,12 +4021,12 @@ fn zset_debug_reload_and_expiry_reprocess_compat() {
             .unwrap();
     }
     let _: Value = redis::cmd("DEBUG").arg("RELOAD").query(&mut conn).unwrap();
-    for i in 0..64 {
+    for (i, expected) in aux.iter().enumerate().take(64) {
         let got: f64 = zscore(&mut conn, "zscoretest", &i.to_string())
             .unwrap()
             .parse()
             .unwrap();
-        assert_eq!(got, aux[i]);
+        assert_eq!(got, *expected);
     }
 
     let url =

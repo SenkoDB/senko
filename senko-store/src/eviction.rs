@@ -69,9 +69,7 @@ pub fn value_bytes(entry: &Entry) -> usize {
         senko_core::SenkoValue::TopK(sketch) => {
             sketch.buckets.len() * std::mem::size_of::<senko_core::HkCell>()
                 + sketch
-                    .item_counts
-                    .iter()
-                    .map(|(item, _)| item.len())
+                    .item_counts.keys().map(|item| item.len())
                     .sum::<usize>()
         }
         #[cfg(feature = "prob")]

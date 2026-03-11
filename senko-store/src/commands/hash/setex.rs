@@ -63,10 +63,8 @@ pub fn hsetex(store: &mut Store, frames: &[Frame<'_>]) -> SenkoResult<Response> 
         let field = parse_compact(field_raw);
         let value = SenkoValue::encode_attempt(value_raw);
         let _ = hash.set(field.clone(), value, expires_at);
-        if let Some(_) = expires_at {
-            if matches!(expiry, ExpirySpec::AtMs(_)) {
-                scheduled.push(field);
-            }
+        if expires_at.is_some() && matches!(expiry, ExpirySpec::AtMs(_)) {
+            scheduled.push(field);
         }
         written += 1;
     }
@@ -92,6 +90,7 @@ pub fn hsetex(store: &mut Store, frames: &[Frame<'_>]) -> SenkoResult<Response> 
     Ok(Response::Integer(written))
 }
 
+#[allow(clippy::type_complexity)]
 fn parse_hsetex_args<'a>(
     frames: &'a [Frame<'_>],
     now_ms: u64,
@@ -177,6 +176,7 @@ fn parse_hsetex_args<'a>(
     Ok((cond, expiry, fields, values))
 }
 
+#[allow(clippy::type_complexity)]
 fn parse_fields_value_pairs<'a>(
     frames: &'a [Frame<'_>],
     idx: usize,

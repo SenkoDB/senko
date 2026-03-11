@@ -364,7 +364,7 @@ fn bench_ring_throughput(c: &mut Criterion) {
                     loop {
                         let message = Arc::new(senko_pubsub::PubSubMessage {
                             channel: "bench:ring".into(),
-                            payload: Bytes::copy_from_slice(&(index as u64).to_le_bytes()),
+                            payload: Bytes::copy_from_slice(&index.to_le_bytes()),
                             kind: senko_pubsub::MessageKind::Message,
                         });
                         if producer.publish(message).is_ok() {

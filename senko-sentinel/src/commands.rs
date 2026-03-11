@@ -701,7 +701,7 @@ fn write_ckquorum(out: &mut BytesMut, runtime: &SharedRuntime, name: &[u8]) -> S
         .values()
         .filter(|sentinel| current_unix_ms().saturating_sub(sentinel.last_ok_ping) <= 2_000)
         .count();
-    let majority = (master.sentinels.len() + 1) / 2 + 1;
+    let majority = master.sentinels.len().div_ceil(2) + 1;
     let message = if usable < master.quorum as usize {
         format!("NOQUORUM {usable} usable Sentinels. Quorum NOT reached for {key}.")
     } else if usable < majority {

@@ -1,3 +1,5 @@
+#![allow(clippy::await_holding_lock)]
+
 use std::{
     cell::RefCell,
     collections::VecDeque,
@@ -168,7 +170,7 @@ impl AclUser {
         self.channel_patterns.clear();
         self.allowed_commands.clear();
         self.allowed_commands
-            .deny_many(command_registry().all_ids().into_iter());
+            .deny_many(command_registry().all_ids());
     }
 
     fn can_auth(&self, password: &[u8]) -> bool {
@@ -475,7 +477,7 @@ pub fn check_permissions(
     if !user.enabled {
         return Err(command_denied(command, meta, context, qbuf_len));
     }
-    let targets = extract_acl_targets(command, args).map_err(|message| error_message(message))?;
+    let targets = extract_acl_targets(command, args).map_err(error_message)?;
     if let Some(command_id) = targets.command_id {
         let command_allowed = if targets.effective_name.as_str()
             != std::str::from_utf8(command).unwrap_or_default()
@@ -1028,7 +1030,7 @@ fn disconnect_users(
             let writer = handle.writer.clone();
             compio::runtime::spawn(async move {
                 let mut writer = writer.lock().expect("writer poisoned");
-                let _ = (&mut *writer).shutdown().await;
+                let _ = (*writer).shutdown().await;
             })
             .detach();
         }
@@ -1301,13 +1303,13 @@ fn extract_acl_targets(command: &[u8], args: &[Frame<'_>]) -> Result<AclTargets,
         .map_err(|_| "ERR syntax error")?
         .to_ascii_lowercase();
     let mut effective_name = root_name.clone();
-    if matches!(root_name.as_str(), "client" | "acl" | "pubsub") {
-        if let Some(first) = args.first() {
-            let sub = std::str::from_utf8(frame_bytes(first).map_err(|_| "ERR syntax error")?)
-                .map_err(|_| "ERR syntax error")?
-                .to_ascii_lowercase();
-            effective_name = format!("{root_name}|{sub}");
-        }
+    if matches!(root_name.as_str(), "client" | "acl" | "pubsub")
+        && let Some(first) = args.first()
+    {
+        let sub = std::str::from_utf8(frame_bytes(first).map_err(|_| "ERR syntax error")?)
+            .map_err(|_| "ERR syntax error")?
+            .to_ascii_lowercase();
+        effective_name = format!("{root_name}|{sub}");
     }
     let mut targets = AclTargets {
         effective_name: CompactString::from(effective_name.as_str()),
@@ -2387,8 +2389,10 @@ mod tests {
         assert_eq!(default_meta.username, "default");
         assert!(default_meta.flags.contains(ConnectionFlags::AUTHENTICATED));
 
-        let mut config = SenkoConfig::default();
-        config.auth_password = Some("secret".to_owned());
+        let config = SenkoConfig {
+            auth_password: Some("secret".to_owned()),
+            ..SenkoConfig::default()
+        };
         let _ = init_test_acl_with(config);
         assert!(!connection_starts_authenticated());
 
@@ -2447,8 +2451,10 @@ mod tests {
     fn acl_save_load_roundtrip_and_invalid_load_is_atomic() {
         let _guard = acl_test_guard();
         let path = temp_acl_path("roundtrip");
-        let mut config = SenkoConfig::default();
-        config.aclfile = Some(path.clone());
+        let config = SenkoConfig {
+            aclfile: Some(path.clone()),
+            ..SenkoConfig::default()
+        };
         let config = init_test_acl_with(config);
         let frames = [
             Frame::BulkString(b"alice"),

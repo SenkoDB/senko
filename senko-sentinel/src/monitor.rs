@@ -101,7 +101,7 @@ impl MonitorEngine {
             .or_insert_with(|| InstanceLink::new(addr));
         self.info_cache
             .entry(name.to_owned())
-            .or_insert_with(Bytes::new);
+            .or_default();
     }
 
     pub fn queue_command(&mut self, addr: SocketAddr, command: SentinelCommand) {

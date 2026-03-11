@@ -130,7 +130,7 @@ fn ts_add(ctx: &mut dyn ModuleCommandContext, args: &[&[u8]]) -> ModuleResult {
 }
 
 fn ts_madd(ctx: &mut dyn ModuleCommandContext, args: &[&[u8]]) -> ModuleResult {
-    if args.len() < 3 || args.len() % 3 != 0 {
+    if args.len() < 3 || !args.len().is_multiple_of(3) {
         return Err(err("ERR wrong number of arguments for 'ts.madd' command"));
     }
     let mut out = SmallVec::new();
@@ -405,8 +405,7 @@ fn incr_decr(ctx: &mut dyn ModuleCommandContext, args: &[&[u8]], incr: bool) -> 
         if eq_ascii(args[index], b"TIMESTAMP") {
             index += 1;
             timestamp = parse_timestamp(
-                *args
-                    .get(index)
+                args.get(index)
                     .ok_or_else(|| err("ERR TSDB: invalid timestamp"))?,
                 now_ms,
             )?;
@@ -689,40 +688,34 @@ fn parse_create_options(args: &[&[u8]], allow_missing: bool) -> Result<CreateOpt
         if eq_ascii(args[index], b"RETENTION") {
             index += 1;
             options.retention_ms = Some(parse_u64(
-                *args
-                    .get(index)
+                args.get(index)
                     .ok_or_else(|| err("ERR TSDB: invalid retention"))?,
             )?);
         } else if eq_ascii(args[index], b"ENCODING") {
             index += 1;
             options.encoding = Some(parse_encoding(
-                *args
-                    .get(index)
+                args.get(index)
                     .ok_or_else(|| err("ERR TSDB: invalid encoding"))?,
             )?);
         } else if eq_ascii(args[index], b"CHUNK") {
             index += 2;
             options.chunk_size = Some(parse_usize(
-                *args
-                    .get(index - 1)
+                args.get(index - 1)
                     .ok_or_else(|| err("ERR TSDB: invalid chunk size"))?,
             )?);
         } else if eq_ascii(args[index], b"DUPLICATE") {
             index += 2;
             options.dup_policy = Some(parse_dup_policy(
-                *args
-                    .get(index - 1)
+                args.get(index - 1)
                     .ok_or_else(|| err("ERR TSDB: invalid duplicate policy"))?,
             )?);
         } else if eq_ascii(args[index], b"IGNORE") {
             let time = parse_i64(
-                *args
-                    .get(index + 1)
+                args.get(index + 1)
                     .ok_or_else(|| err("ERR TSDB: invalid ignore"))?,
             )?;
             let value = parse_f64(
-                *args
-                    .get(index + 2)
+                args.get(index + 2)
                     .ok_or_else(|| err("ERR TSDB: invalid ignore"))?,
             )?;
             options.ignore = Some(IgnoreConfig {
@@ -756,8 +749,7 @@ fn parse_add_options(args: &[&[u8]]) -> Result<AddOptions, ModuleError> {
                 .is_some_and(|value| eq_ascii(value, b"DUPLICATE"))
         {
             on_duplicate = Some(parse_dup_policy(
-                *args
-                    .get(index + 2)
+                args.get(index + 2)
                     .ok_or_else(|| err("ERR TSDB: invalid duplicate policy"))?,
             )?);
             index += 3;
@@ -817,7 +809,7 @@ fn apply_alter_options(series: &mut TimeSeries, options: CreateOptions) {
 }
 
 fn parse_labels(args: &[&[u8]]) -> Result<Vec<(String, String)>, ModuleError> {
-    if args.len() % 2 != 0 {
+    if !args.len().is_multiple_of(2) {
         return Err(err("ERR TSDB: wrong number of labels"));
     }
     args.chunks(2)
@@ -860,18 +852,15 @@ fn parse_multi_query_tail(
     Err(err("ERR TSDB: FILTER argument is missing"))
 }
 
-fn parse_multi_range_query(
-    args: &[&[u8]],
-) -> Result<
-    (
-        RangeQuery,
-        LabelMode,
-        Vec<String>,
-        Vec<Filter>,
-        Option<(String, Aggregation)>,
-    ),
-    ModuleError,
-> {
+type MultiRangeQuery = (
+    RangeQuery,
+    LabelMode,
+    Vec<String>,
+    Vec<Filter>,
+    Option<(String, Aggregation)>,
+);
+
+fn parse_multi_range_query(args: &[&[u8]]) -> Result<MultiRangeQuery, ModuleError> {
     let mut query = RangeQuery::default();
     let mut label_mode = LabelMode::None;
     let mut selected = Vec::new();
@@ -957,13 +946,11 @@ fn parse_range_query_one(query: &mut RangeQuery, args: &[&[u8]]) -> Result<usize
         && args.get(2).is_some_and(|value| eq_ascii(value, b"VALUE"))
     {
         let min = parse_f64(
-            *args
-                .get(3)
+            args.get(3)
                 .ok_or_else(|| err("ERR TSDB: invalid FILTER_BY_VALUE"))?,
         )?;
         let max = parse_f64(
-            *args
-                .get(4)
+            args.get(4)
                 .ok_or_else(|| err("ERR TSDB: invalid FILTER_BY_VALUE"))?,
         )?;
         query.filter_value = Some((min, max));
@@ -971,25 +958,23 @@ fn parse_range_query_one(query: &mut RangeQuery, args: &[&[u8]]) -> Result<usize
     }
     if eq_ascii(args[0], b"COUNT") {
         query.count = Some(parse_usize(
-            *args.get(1).ok_or_else(|| err("ERR TSDB: invalid COUNT"))?,
+            args.get(1).ok_or_else(|| err("ERR TSDB: invalid COUNT"))?,
         )?);
         return Ok(2);
     }
     if eq_ascii(args[0], b"ALIGN") {
         query.align = Some(parse_i64(
-            *args.get(1).ok_or_else(|| err("ERR TSDB: invalid ALIGN"))?,
+            args.get(1).ok_or_else(|| err("ERR TSDB: invalid ALIGN"))?,
         )?);
         return Ok(2);
     }
     if eq_ascii(args[0], b"AGGREGATION") {
         let aggregation = parse_aggregation(
-            *args
-                .get(1)
+            args.get(1)
                 .ok_or_else(|| err("ERR TSDB: invalid AGGREGATION"))?,
         )?;
         let bucket = parse_u64(
-            *args
-                .get(2)
+            args.get(2)
                 .ok_or_else(|| err("ERR TSDB: invalid AGGREGATION"))?,
         )?;
         let mut consumed = 3usize;
@@ -998,8 +983,7 @@ fn parse_range_query_one(query: &mut RangeQuery, args: &[&[u8]]) -> Result<usize
         while consumed < args.len() {
             if eq_ascii(args[consumed], b"BUCKETTIMESTAMP") {
                 bucket_timestamp = parse_bucket_timestamp(
-                    *args
-                        .get(consumed + 1)
+                    args.get(consumed + 1)
                         .ok_or_else(|| err("ERR TSDB: invalid BUCKETTIMESTAMP"))?,
                 )?;
                 consumed += 2;

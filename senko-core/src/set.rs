@@ -70,6 +70,10 @@ impl IntSet {
         self.data.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
     pub fn iter(&self) -> std::slice::Iter<'_, i64> {
         self.data.iter()
     }
@@ -308,7 +312,7 @@ impl SetObject {
     fn ensure_encoding_for_insert(&mut self, member: &[u8], int_value: Option<i64>) {
         match &self.inner {
             SetEncoding::Intset(intset) => {
-                let would_insert = int_value.map_or(true, |value| !intset.contains(value));
+                let would_insert = int_value.is_none_or(|value| !intset.contains(value));
                 if !would_insert {
                     return;
                 }
