@@ -104,13 +104,15 @@ fn avalanche64(mut value: u64) -> u64 {
 
 fn read_u64(input: &[u8]) -> u64 {
     let mut bytes = [0u8; 8];
-    bytes[..input.len()].copy_from_slice(input);
+    let len = input.len().min(bytes.len());
+    bytes[..len].copy_from_slice(&input[..len]);
     u64::from_le_bytes(bytes)
 }
 
 fn read_u32(input: &[u8]) -> u32 {
     let mut bytes = [0u8; 4];
-    bytes[..input.len()].copy_from_slice(input);
+    let len = input.len().min(bytes.len());
+    bytes[..len].copy_from_slice(&input[..len]);
     u32::from_le_bytes(bytes)
 }
 
@@ -130,12 +132,12 @@ pub fn xxhash3_128(data: &[u8]) -> u128 {
     if rem.len() >= 8 {
         acc1 ^= read_u64(&rem[..8]).wrapping_mul(XXH_PRIME_2);
         acc1 = avalanche64(acc1);
-        acc2 ^= read_u32(&rem[8..]) as u64 * XXH_PRIME_1;
+        acc2 ^= (read_u32(&rem[8..]) as u64).wrapping_mul(XXH_PRIME_1);
         acc2 = avalanche64(acc2);
     } else if rem.len() >= 4 {
-        acc1 ^= read_u32(&rem[..4]) as u64 * XXH_PRIME_1;
+        acc1 ^= (read_u32(&rem[..4]) as u64).wrapping_mul(XXH_PRIME_1);
         acc1 = avalanche64(acc1);
-        acc2 ^= read_u32(&rem[4..]) as u64 * XXH_PRIME_2;
+        acc2 ^= (read_u32(&rem[4..]) as u64).wrapping_mul(XXH_PRIME_2);
         acc2 = avalanche64(acc2);
     } else if !rem.is_empty() {
         let mut tail = 0u64;
@@ -964,7 +966,7 @@ pub enum ProbMergeValue {
 
 #[cfg(test)]
 mod tests {
-    use super::{BloomFilter, CountMinSketch, TDigest, TopKSketch};
+    use super::{BloomFilter, CountMinSketch, TDigest, TopKSketch, xxhash3_128};
 
     #[test]
     fn bloom_round_trip_has_no_false_negatives() {
@@ -997,6 +999,16 @@ mod tests {
         }
         assert!(sketch.query(b"alpha"));
         assert!(sketch.count(b"alpha") >= sketch.count(b"beta"));
+    }
+
+    #[test]
+    fn xxhash_tail_paths_do_not_overflow_in_debug() {
+        for len in 4..16 {
+            let input = vec![0xff; len];
+            let first = xxhash3_128(&input);
+            let second = xxhash3_128(&input);
+            assert_eq!(first, second);
+        }
     }
 
     #[test]
