@@ -23,6 +23,7 @@ use senko_sentinel::{
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: MiMalloc = MiMalloc;
+const SHARD_PROACTOR_CAPACITY: u32 = 256;
 
 fn desired_driver_type() -> DriverType {
     #[cfg(windows)]
@@ -46,6 +47,7 @@ fn shard_core(core_ids: &[CoreId], shard_index: usize) -> Option<CoreId> {
 fn runtime_builder_for(core_id: Option<CoreId>) -> RuntimeBuilder {
     let mut proactor = ProactorBuilder::new();
     proactor.driver_type(desired_driver_type());
+    proactor.capacity(SHARD_PROACTOR_CAPACITY);
     proactor.thread_pool_limit(1);
 
     let mut builder = RuntimeBuilder::new();

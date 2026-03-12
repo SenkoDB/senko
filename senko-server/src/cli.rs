@@ -71,7 +71,7 @@ pub struct CliOverrides {
     #[arg(
         long,
         env = "SENKO_IO_THREADS",
-        help = "Number of I/O threads (default: CPU count)"
+        help = "Number of I/O threads (default: logical CPU count)"
     )]
     pub io_threads: Option<usize>,
     #[arg(long, env = "SENKO_UNIXSOCKET", help = "Unix socket path")]
