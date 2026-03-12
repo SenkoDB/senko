@@ -447,7 +447,12 @@ impl Connection {
 
     fn cleanup_connection_state(&mut self) {
         server_info::on_connection_close(self.shard_id);
-        pubsub::cleanup_pubsub_state(self.meta.id, &mut self.pubsub, &self.shard_pubsub);
+        pubsub::cleanup_pubsub_state(
+            self.meta.id,
+            &mut self.pubsub,
+            &self.shard_pubsub,
+            &self.cluster,
+        );
         self.meta.flags.remove(ConnectionFlags::PUBSUB);
         if let Some(subscription) = self.monitor.take() {
             command_info::unsubscribe_monitor(&subscription);
@@ -930,7 +935,7 @@ async fn execute_immediate_command(
         let outcome = result
             .map(|outcome| {
                 if eq_ascii(command, b"RESET") {
-                    pubsub::cleanup_pubsub_state(meta.id, pubsub, shard_pubsub);
+                    pubsub::cleanup_pubsub_state(meta.id, pubsub, shard_pubsub, cluster);
                     meta.flags.remove(ConnectionFlags::PUBSUB);
                     if let Some(subscription) = monitor.take() {
                         command_info::unsubscribe_monitor(&subscription);

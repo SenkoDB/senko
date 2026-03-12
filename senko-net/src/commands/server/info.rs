@@ -21,6 +21,7 @@ use hashbrown::HashMap;
 use senko_cluster::NodeId;
 use senko_core::{ProbMergeValue, SenkoConfig, SenkoValue};
 use senko_proto::Frame;
+use senko_pubsub::BroadcastSlot;
 use senko_scripting::{LuaEngine, functions::RestoreMode};
 use senko_store::{Response, Store};
 use smallvec::{SmallVec, smallvec};
@@ -163,6 +164,21 @@ pub(crate) enum ShardQuery {
     },
     KillScript {
         reply: Sender<Result<bool, String>>,
+    },
+    ShardPubSubSubscribe {
+        channel: Bytes,
+        conn_id: u64,
+        reply: Sender<Result<Arc<BroadcastSlot>, String>>,
+    },
+    ShardPubSubUnsubscribe {
+        channel: Bytes,
+        conn_id: u64,
+        reply: Sender<Result<(), String>>,
+    },
+    ShardPubSubPublish {
+        channel: Bytes,
+        payload: Bytes,
+        reply: Sender<Result<u64, String>>,
     },
 }
 
@@ -612,6 +628,36 @@ pub(crate) fn drain_shard_queries(
                     Err(error) => Err(error.client_message()),
                 };
                 let _ = reply.send(result);
+            }
+            ShardQuery::ShardPubSubSubscribe {
+                channel,
+                conn_id,
+                reply,
+            } => {
+                let slot = shard_pubsub
+                    .borrow_mut()
+                    .subscribe_shard_local(channel.as_ref(), conn_id);
+                let _ = reply.send(Ok(slot));
+            }
+            ShardQuery::ShardPubSubUnsubscribe {
+                channel,
+                conn_id,
+                reply,
+            } => {
+                let _ = shard_pubsub
+                    .borrow_mut()
+                    .unsubscribe_shard_local(channel.as_ref(), conn_id);
+                let _ = reply.send(Ok(()));
+            }
+            ShardQuery::ShardPubSubPublish {
+                channel,
+                payload,
+                reply,
+            } => {
+                let delivered = shard_pubsub
+                    .borrow_mut()
+                    .spublish_local(channel.as_ref(), payload);
+                let _ = reply.send(Ok(delivered));
             }
         }
     }
@@ -1234,6 +1280,57 @@ pub async fn kill_running_script() -> Result<bool, Vec<u8>> {
     Ok(replies.into_iter().any(|value| value))
 }
 
+pub fn shard_pubsub_subscribe(
+    shard_id: usize,
+    channel: Bytes,
+    conn_id: u64,
+) -> Result<Arc<BroadcastSlot>, Vec<u8>> {
+    let bus = query_bus();
+    let (reply_tx, reply_rx) = flume::bounded(1);
+    bus.sender(shard_id)
+        .send(ShardQuery::ShardPubSubSubscribe {
+            channel,
+            conn_id,
+            reply: reply_tx,
+        })
+        .map_err(|_| error_message("ERR shard coordination timeout"))?;
+    wait_for_single_sync_reply(reply_rx)
+}
+
+pub fn shard_pubsub_unsubscribe(
+    shard_id: usize,
+    channel: Bytes,
+    conn_id: u64,
+) -> Result<(), Vec<u8>> {
+    let bus = query_bus();
+    let (reply_tx, reply_rx) = flume::bounded(1);
+    bus.sender(shard_id)
+        .send(ShardQuery::ShardPubSubUnsubscribe {
+            channel,
+            conn_id,
+            reply: reply_tx,
+        })
+        .map_err(|_| error_message("ERR shard coordination timeout"))?;
+    wait_for_single_sync_reply(reply_rx)
+}
+
+pub fn shard_pubsub_publish(
+    shard_id: usize,
+    channel: Bytes,
+    payload: Bytes,
+) -> Result<u64, Vec<u8>> {
+    let bus = query_bus();
+    let (reply_tx, reply_rx) = flume::bounded(1);
+    bus.sender(shard_id)
+        .send(ShardQuery::ShardPubSubPublish {
+            channel,
+            payload,
+            reply: reply_tx,
+        })
+        .map_err(|_| error_message("ERR shard coordination timeout"))?;
+    wait_for_single_sync_reply(reply_rx)
+}
+
 pub async fn save_rdb_snapshot(config: &SenkoConfig) -> Result<(), String> {
     let bus = query_bus();
     let (pause_tx, pause_rx) = flume::bounded(bus.shard_count());
@@ -1342,6 +1439,22 @@ async fn wait_for_result_replies<T>(
         Ok(out)
     } else {
         Err(error_message("ERR shard coordination timeout"))
+    }
+}
+
+fn wait_for_single_sync_reply<T>(reply_rx: Receiver<Result<T, String>>) -> Result<T, Vec<u8>> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match reply_rx.try_recv() {
+            Ok(Ok(value)) => return Ok(value),
+            Ok(Err(error)) => return Err(error_message(&error)),
+            Err(flume::TryRecvError::Empty) if std::time::Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(flume::TryRecvError::Empty) | Err(flume::TryRecvError::Disconnected) => {
+                return Err(error_message("ERR shard coordination timeout"));
+            }
+        }
     }
 }
 

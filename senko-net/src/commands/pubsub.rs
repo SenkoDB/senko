@@ -20,6 +20,7 @@ use smallvec::SmallVec;
 
 use crate::{
     commands::cluster::ClusterCommandState,
+    commands::server::info as server_info,
     connection::{
         ConnectionFlags, ConnectionMeta, error_bytes, error_message, frame_bytes,
         serialize_response,
@@ -28,7 +29,6 @@ use crate::{
 };
 
 const PUBSUB_CONTEXT_ERROR: &str = "ERR Command not allowed inside a pub/sub context";
-const SHARD_ROUTE_ERROR: &str = "ERR shard channel is not served by this shard";
 const UNKNOWN_PUBSUB_SUBCOMMAND: &str =
     "ERR Unknown PUBSUB subcommand or wrong number of arguments";
 
@@ -186,20 +186,36 @@ pub(crate) fn cleanup_pubsub_state(
     conn_id: u64,
     pubsub: &mut Option<PubSubState>,
     shard_pubsub: &Rc<RefCell<ShardFanOut>>,
+    cluster: &Rc<RefCell<ClusterCommandState>>,
 ) {
     let Some(state) = pubsub.take() else {
         return;
     };
 
-    let mut fanout = shard_pubsub.borrow_mut();
+    let local_shard = shard_pubsub.borrow().shard_id();
     for channel in state.channel_slots.keys() {
-        let _ = fanout.unsubscribe(channel.as_bytes(), conn_id);
+        let _ = shard_pubsub
+            .borrow_mut()
+            .unsubscribe(channel.as_bytes(), conn_id);
     }
     for pattern in state.pattern_slots.keys() {
-        let _ = fanout.punsubscribe(pattern.as_bytes(), conn_id);
+        let _ = shard_pubsub
+            .borrow_mut()
+            .punsubscribe(pattern.as_bytes(), conn_id);
     }
     for channel in state.shard_channel_slots.keys() {
-        let _ = fanout.unsubscribe_shard_local(channel.as_bytes(), conn_id);
+        let target_shard = shard_channel_owner(&cluster.borrow(), channel.as_bytes());
+        if target_shard == local_shard {
+            let _ = shard_pubsub
+                .borrow_mut()
+                .unsubscribe_shard_local(channel.as_bytes(), conn_id);
+        } else {
+            let _ = server_info::shard_pubsub_unsubscribe(
+                target_shard,
+                Bytes::copy_from_slice(channel.as_bytes()),
+                conn_id,
+            );
+        }
     }
 }
 
@@ -386,14 +402,23 @@ fn handle_ssubscribe(
 
     let state = pubsub.get_or_insert_with(PubSubState::default);
     let mut response = Vec::new();
-    let shard_id = shard_pubsub.borrow().shard_id();
+    let local_shard = shard_pubsub.borrow().shard_id();
     let cluster = cluster.borrow();
-    let mut fanout = shard_pubsub.borrow_mut();
 
     for arg in args {
         let channel = compact_frame(arg)?;
-        ensure_local_shard_channel(&cluster, shard_id, channel.as_bytes())?;
-        let slot = fanout.subscribe_shard_local(channel.as_bytes(), meta.id);
+        let target_shard = shard_channel_owner(&cluster, channel.as_bytes());
+        let slot = if target_shard == local_shard {
+            shard_pubsub
+                .borrow_mut()
+                .subscribe_shard_local(channel.as_bytes(), meta.id)
+        } else {
+            server_info::shard_pubsub_subscribe(
+                target_shard,
+                Bytes::copy_from_slice(channel.as_bytes()),
+                meta.id,
+            )?
+        };
         state.shard_channel_slots.insert(channel.clone(), slot);
         response.extend_from_slice(&serialize_subscription_confirmation(
             b"ssubscribe",
@@ -435,13 +460,22 @@ fn handle_sunsubscribe(
         collect_names(args)?
     };
 
-    let shard_id = shard_pubsub.borrow().shard_id();
+    let local_shard = shard_pubsub.borrow().shard_id();
     let cluster = cluster.borrow();
-    let mut fanout = shard_pubsub.borrow_mut();
     for channel in channels {
         if !channel.is_empty() {
-            ensure_local_shard_channel(&cluster, shard_id, channel.as_bytes())?;
-            let _ = fanout.unsubscribe_shard_local(channel.as_bytes(), meta.id);
+            let target_shard = shard_channel_owner(&cluster, channel.as_bytes());
+            if target_shard == local_shard {
+                let _ = shard_pubsub
+                    .borrow_mut()
+                    .unsubscribe_shard_local(channel.as_bytes(), meta.id);
+            } else {
+                server_info::shard_pubsub_unsubscribe(
+                    target_shard,
+                    Bytes::copy_from_slice(channel.as_bytes()),
+                    meta.id,
+                )?;
+            }
             state.shard_channel_slots.remove(channel.as_str());
         }
         response.extend_from_slice(&serialize_subscription_confirmation(
@@ -489,11 +523,19 @@ fn handle_spublish(
     };
     let channel = frame_bytes(channel).map_err(|error| error_bytes(&error))?;
     let payload = frame_bytes(payload).map_err(|error| error_bytes(&error))?;
-    let shard_id = shard_pubsub.borrow().shard_id();
-    ensure_local_shard_channel(&cluster.borrow(), shard_id, channel)?;
-    let delivered = shard_pubsub
-        .borrow_mut()
-        .spublish_local(channel, Bytes::copy_from_slice(payload));
+    let local_shard = shard_pubsub.borrow().shard_id();
+    let target_shard = shard_channel_owner(&cluster.borrow(), channel);
+    let delivered = if target_shard == local_shard {
+        shard_pubsub
+            .borrow_mut()
+            .spublish_local(channel, Bytes::copy_from_slice(payload))
+    } else {
+        server_info::shard_pubsub_publish(
+            target_shard,
+            Bytes::copy_from_slice(channel),
+            Bytes::copy_from_slice(payload),
+        )?
+    };
     Ok(outcome(integer_response(delivered as i64)))
 }
 
@@ -638,25 +680,12 @@ fn serialize_pubsub_frame(items: &[PubSubItem<'_>], resp3: bool) -> Vec<u8> {
     out.to_vec()
 }
 
-fn ensure_local_shard_channel(
-    cluster: &ClusterCommandState,
-    local_shard: usize,
-    channel: &[u8],
-) -> Result<(), Vec<u8>> {
+fn shard_channel_owner(cluster: &ClusterCommandState, channel: &[u8]) -> usize {
     if !cluster.is_enabled() {
-        if local_shard == 0 {
-            return Ok(());
-        }
-        return Err(error_message(SHARD_ROUTE_ERROR));
+        return 0;
     }
-
     let slot = senko_cluster::crc16_slot(channel);
-    let owner = usize::from(cluster.slot_table().entry(slot).shard_index);
-    if owner == local_shard {
-        Ok(())
-    } else {
-        Err(error_message(SHARD_ROUTE_ERROR))
-    }
+    usize::from(cluster.slot_table().entry(slot).shard_index)
 }
 
 fn update_pubsub_mode(meta: &mut ConnectionMeta, pubsub: &Option<PubSubState>) {
@@ -1101,7 +1130,7 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        cleanup_pubsub_state(meta.id, &mut state, &fanout);
+        cleanup_pubsub_state(meta.id, &mut state, &fanout, &cluster);
         assert!(state.is_none());
         assert_eq!(fanout.borrow().pubsub_numsub(b"chan"), 0);
         assert_eq!(fanout.borrow().pubsub_numpat(), 0);
