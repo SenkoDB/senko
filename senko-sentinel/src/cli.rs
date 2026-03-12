@@ -593,7 +593,7 @@ fn sentinel_alias_groups() -> BTreeMap<String, Vec<String>> {
 }
 
 fn canonical_flag_name(key: &str) -> String {
-    key.replace('.', "-").replace('_', "-")
+    key.replace(['.', '_'], "-")
 }
 
 fn leak(text: String) -> &'static str {
