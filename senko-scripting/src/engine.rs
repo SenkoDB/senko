@@ -103,7 +103,7 @@ pub struct ScriptContext<'a> {
     pub hooks: &'a mut dyn ScriptExecutionHooks,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct HookState {
     active: bool,
     start_time: Option<Instant>,
@@ -111,19 +111,6 @@ struct HookState {
     readonly: bool,
     has_written: bool,
     busy: bool,
-}
-
-impl Default for HookState {
-    fn default() -> Self {
-        Self {
-            active: false,
-            start_time: None,
-            time_limit_ms: 0,
-            readonly: false,
-            has_written: false,
-            busy: false,
-        }
-    }
 }
 
 pub struct LuaEngine {
@@ -437,14 +424,16 @@ impl LuaEngine {
                                     lua_ref,
                                     true,
                                     values,
-                                    &call_hooks,
-                                    call_username.as_str(),
-                                    readonly,
-                                    db_id,
-                                    max_depth,
-                                    &call_depth_ref,
-                                    &call_propagation,
-                                    &call_hook_state,
+                                    ScriptCallContext {
+                                        hooks: Rc::clone(&call_hooks),
+                                        username: call_username.clone(),
+                                        readonly,
+                                        db_id,
+                                        max_depth,
+                                        command_depth: Rc::clone(&call_depth_ref),
+                                        propagation: Rc::clone(&call_propagation),
+                                        hook_state: Arc::clone(&call_hook_state),
+                                    },
                                 )
                             })?,
                         )?;
@@ -455,14 +444,16 @@ impl LuaEngine {
                                     lua_ref,
                                     false,
                                     values,
-                                    &pcall_hooks,
-                                    pcall_username.as_str(),
-                                    readonly,
-                                    db_id,
-                                    max_depth,
-                                    &pcall_depth_ref,
-                                    &pcall_propagation,
-                                    &pcall_hook_state,
+                                    ScriptCallContext {
+                                        hooks: Rc::clone(&pcall_hooks),
+                                        username: pcall_username.clone(),
+                                        readonly,
+                                        db_id,
+                                        max_depth,
+                                        command_depth: Rc::clone(&pcall_depth_ref),
+                                        propagation: Rc::clone(&pcall_propagation),
+                                        hook_state: Arc::clone(&pcall_hook_state),
+                                    },
                                 )
                             })?,
                         )?;
@@ -876,18 +867,22 @@ fn resp_to_lua(lua: &Lua, value: RespValue) -> Result<Value, LuaError> {
     }
 }
 
+struct ScriptCallContext<'a> {
+    hooks: Rc<RefCell<&'a mut dyn ScriptExecutionHooks>>,
+    username: String,
+    readonly: bool,
+    db_id: u8,
+    max_depth: u32,
+    command_depth: Rc<Cell<u32>>,
+    propagation: Rc<RefCell<ScriptPropagation>>,
+    hook_state: Arc<Mutex<HookState>>,
+}
+
 fn dispatch_script_call(
     lua: &Lua,
     raise_errors: bool,
     values: MultiValue,
-    hooks: &Rc<RefCell<&mut dyn ScriptExecutionHooks>>,
-    username: &str,
-    readonly: bool,
-    db_id: u8,
-    max_depth: u32,
-    command_depth: &Rc<Cell<u32>>,
-    propagation: &Rc<RefCell<ScriptPropagation>>,
-    hook_state: &Arc<Mutex<HookState>>,
+    ctx: ScriptCallContext<'_>,
 ) -> Result<Value, mlua::Error> {
     let mut parts = values.into_iter();
     let Some(command) = parts.next() else {
@@ -900,26 +895,27 @@ fn dispatch_script_call(
             LuaError::ForbiddenCommand(command_upper).client_message(),
         ));
     }
-    if readonly && redis_api::is_write_command(command_upper.as_str()) {
+    if ctx.readonly && redis_api::is_write_command(command_upper.as_str()) {
         return Err(mlua::Error::runtime(
             LuaError::ReadonlyViolation(command_upper).client_message(),
         ));
     }
-    let depth = command_depth.get().saturating_add(1);
-    if depth > max_depth {
+    let depth = ctx.command_depth.get().saturating_add(1);
+    if depth > ctx.max_depth {
         return Err(mlua::Error::runtime("ERR script recursion depth exceeded"));
     }
-    command_depth.set(depth);
+    ctx.command_depth.set(depth);
     let mut args = parts
         .map(lua_value_to_bytes)
         .collect::<Result<Vec<_>, _>>()
         .map_err(mlua::Error::external)?;
     redis_api::normalize_command_args(command_upper.as_str(), &mut args);
-    if let Err(error) = hooks
-        .borrow_mut()
-        .acl_check(username, command_upper.as_bytes(), &args)
+    if let Err(error) =
+        ctx.hooks
+            .borrow_mut()
+            .acl_check(ctx.username.as_str(), command_upper.as_bytes(), &args)
     {
-        command_depth.set(depth.saturating_sub(1));
+        ctx.command_depth.set(depth.saturating_sub(1));
         return if raise_errors {
             Err(mlua::Error::runtime(error.client_message()))
         } else {
@@ -928,18 +924,21 @@ fn dispatch_script_call(
                 .map_err(mlua::Error::external)
         };
     }
-    let response = hooks.borrow_mut().dispatch(command_upper.as_bytes(), &args);
-    command_depth.set(depth.saturating_sub(1));
+    let response = ctx
+        .hooks
+        .borrow_mut()
+        .dispatch(command_upper.as_bytes(), &args);
+    ctx.command_depth.set(depth.saturating_sub(1));
     match response {
         Ok(response) => {
             if redis_api::is_write_command(command_upper.as_str()) {
-                propagation.borrow_mut().push(
-                    db_id,
+                ctx.propagation.borrow_mut().push(
+                    ctx.db_id,
                     &std::iter::once(Bytes::copy_from_slice(command_upper.as_bytes()))
                         .chain(args.iter().cloned())
                         .collect::<Vec<_>>(),
                 );
-                let mut state = hook_state.lock().expect("hook state lock poisoned");
+                let mut state = ctx.hook_state.lock().expect("hook state lock poisoned");
                 state.has_written = true;
             }
             resp_to_lua(lua, response).map_err(mlua::Error::external)

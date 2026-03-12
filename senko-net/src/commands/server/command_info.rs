@@ -8,7 +8,7 @@ use std::{
 
 use ahash::RandomState;
 use bytes::Bytes;
-use flume::{Receiver, Sender};
+use crossfire::compat::{BlockingRxTrait, MRx as Receiver, MTx as Sender};
 use hashbrown::HashMap;
 use senko_core::{SenkoConfig, SenkoValue};
 use senko_proto::Frame;
@@ -1032,7 +1032,7 @@ impl MonitorRegistry {
     }
 
     fn subscribe(&self, shard_id: usize) -> MonitorSubscription {
-        let (sender, receiver) = flume::bounded(512);
+        let (sender, receiver) = crossfire::compat::mpmc::bounded_blocking(512);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let shard = &self.shards[shard_id];
         shard

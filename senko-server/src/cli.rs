@@ -265,7 +265,7 @@ fn alias_groups() -> BTreeMap<String, Vec<String>> {
 }
 
 fn canonical_flag_name(key: &str) -> String {
-    key.replace('.', "-").replace('_', "-")
+    key.replace(['.', '_'], "-")
 }
 
 fn config_env_name(long: &str) -> String {

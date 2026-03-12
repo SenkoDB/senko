@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use ahash::RandomState;
 use bytes::Bytes;
 use compact_str::CompactString;
-use flume::{Receiver, Sender, TrySendError};
+use crossfire::compat::{MRx as Receiver, MTx as Sender, TrySendError};
 use hashbrown::HashMap;
 use senko_cluster::{SLOT_COUNT, crc16_slot};
 use senko_pubsub::{BroadcastSlot, ChannelRegistry, MessageKind, PubSubMessage};
@@ -80,7 +80,8 @@ impl CrossShardBus {
         let mut senders = Vec::with_capacity(num_shards);
         let mut receivers = Vec::with_capacity(num_shards);
         for _ in 0..num_shards {
-            let (sender, receiver) = flume::bounded(FANOUT_QUEUE_CAPACITY);
+            let (sender, receiver) =
+                crossfire::compat::mpmc::bounded_blocking(FANOUT_QUEUE_CAPACITY);
             senders.push(sender);
             receivers.push(Mutex::new(Some(receiver)));
         }

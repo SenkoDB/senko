@@ -16,7 +16,7 @@ use std::{
 
 use bytes::Bytes;
 use compio::runtime::spawn_blocking;
-use flume::{Receiver, Sender};
+use crossfire::compat::{BlockingRxTrait, MRx as Receiver, MTx as Sender, TryRecvError};
 use hashbrown::HashMap;
 use senko_cluster::NodeId;
 use senko_core::{ProbMergeValue, SenkoConfig, SenkoValue};
@@ -193,7 +193,7 @@ impl ShardQueryBus {
         let mut senders = Vec::with_capacity(num_shards);
         let mut receivers = Vec::with_capacity(num_shards);
         for _ in 0..num_shards {
-            let (sender, receiver) = flume::bounded(64);
+            let (sender, receiver) = crossfire::compat::mpmc::bounded_blocking(64);
             senders.push(sender);
             receivers.push(Mutex::new(Some(receiver)));
         }
@@ -624,7 +624,7 @@ pub(crate) fn drain_shard_queries(
             ShardQuery::KillScript { reply } => {
                 let result = match engine.borrow().request_kill() {
                     Ok(()) => Ok(true),
-                    Err(error) if matches!(error, senko_scripting::LuaError::NotBusy) => Ok(false),
+                    Err(senko_scripting::LuaError::NotBusy) => Ok(false),
                     Err(error) => Err(error.client_message()),
                 };
                 let _ = reply.send(result);
@@ -1006,7 +1006,7 @@ pub async fn aggregate_snapshot_for_diagnostics() -> AggregateSnapshotForDiagnos
 
 async fn query_all_shards(now_ms: u64) -> AggregateSnapshot {
     let bus = query_bus();
-    let (reply_tx, reply_rx) = flume::bounded(bus.shard_count());
+    let (reply_tx, reply_rx) = crossfire::compat::mpmc::bounded_blocking(bus.shard_count());
     for shard_id in 0..bus.shard_count() {
         let _ = bus.sender(shard_id).send(ShardQuery::Snapshot {
             reply: reply_tx.clone(),
@@ -1019,8 +1019,8 @@ async fn query_all_shards(now_ms: u64) -> AggregateSnapshot {
     while shard_snapshots.len() < bus.shard_count() && std::time::Instant::now() < deadline {
         match reply_rx.try_recv() {
             Ok(snapshot) => shard_snapshots.push(snapshot),
-            Err(flume::TryRecvError::Empty) => compio::time::sleep(Duration::from_millis(1)).await,
-            Err(flume::TryRecvError::Disconnected) => break,
+            Err(TryRecvError::Empty) => compio::time::sleep(Duration::from_millis(1)).await,
+            Err(TryRecvError::Disconnected) => break,
         }
     }
 
@@ -1073,7 +1073,7 @@ async fn query_all_shards(now_ms: u64) -> AggregateSnapshot {
 
 pub async fn flush_all_shards_sync() -> Result<(), Vec<u8>> {
     let bus = query_bus();
-    let (reply_tx, reply_rx) = flume::bounded(bus.shard_count());
+    let (reply_tx, reply_rx) = crossfire::compat::mpmc::bounded_blocking(bus.shard_count());
     for shard_id in 0..bus.shard_count() {
         let _ = bus.sender(shard_id).send(ShardQuery::Flush {
             reply: Some(reply_tx.clone()),
@@ -1092,7 +1092,7 @@ pub fn flush_all_shards_async() {
 
 pub async fn memory_usage_for_key(key: &[u8], _samples: usize) -> Option<u64> {
     let bus = query_bus();
-    let (reply_tx, reply_rx) = flume::bounded(bus.shard_count());
+    let (reply_tx, reply_rx) = crossfire::compat::mpmc::bounded_blocking(bus.shard_count());
     for shard_id in 0..bus.shard_count() {
         let _ = bus.sender(shard_id).send(ShardQuery::MemoryUsage {
             key: key.to_vec(),
@@ -1105,8 +1105,8 @@ pub async fn memory_usage_for_key(key: &[u8], _samples: usize) -> Option<u64> {
         match reply_rx.try_recv() {
             Ok(Some(usage)) => return Some(usage),
             Ok(None) => {}
-            Err(flume::TryRecvError::Empty) => compio::time::sleep(Duration::from_millis(1)).await,
-            Err(flume::TryRecvError::Disconnected) => break,
+            Err(TryRecvError::Empty) => compio::time::sleep(Duration::from_millis(1)).await,
+            Err(TryRecvError::Disconnected) => break,
         }
     }
     None
@@ -1121,7 +1121,7 @@ pub(crate) fn fetch_prob_merge_values_for_key(
     if expected == 0 {
         return Vec::new();
     }
-    let (reply_tx, reply_rx) = flume::bounded(expected);
+    let (reply_tx, reply_rx) = crossfire::compat::mpmc::bounded_blocking(expected);
     for shard_id in 0..bus.shard_count() {
         if shard_id == other_than_shard_id {
             continue;
@@ -1145,27 +1145,26 @@ pub(crate) fn fetch_prob_merge_values_for_key(
             Ok(None) => {
                 replies += 1;
             }
-            Err(flume::TryRecvError::Empty) => thread::sleep(Duration::from_millis(1)),
-            Err(flume::TryRecvError::Disconnected) => break,
+            Err(TryRecvError::Empty) => thread::sleep(Duration::from_millis(1)),
+            Err(TryRecvError::Disconnected) => break,
         }
     }
     values
 }
 
 pub async fn script_load_all(script: Bytes) -> Result<String, Vec<u8>> {
-    let _guard = scripting_metadata_lock()
-        .lock()
-        .expect("scripting metadata lock poisoned");
-    let bus = query_bus();
-    let (reply_tx, reply_rx) = flume::bounded(bus.shard_count());
-    for shard_id in 0..bus.shard_count() {
-        let _ = bus.sender(shard_id).send(ShardQuery::ScriptLoad {
-            script: script.clone(),
-            reply: reply_tx.clone(),
-        });
-    }
-    drop(reply_tx);
-    let replies = wait_for_result_replies(reply_rx, bus.shard_count()).await?;
+    let replies = run_locked_scripting_query(move |bus| {
+        let (reply_tx, reply_rx) = crossfire::compat::mpmc::bounded_blocking(bus.shard_count());
+        for shard_id in 0..bus.shard_count() {
+            let _ = bus.sender(shard_id).send(ShardQuery::ScriptLoad {
+                script: script.clone(),
+                reply: reply_tx.clone(),
+            });
+        }
+        drop(reply_tx);
+        wait_for_result_replies_sync(reply_rx, bus.shard_count())
+    })
+    .await?;
     let mut iter = replies.into_iter();
     let Some(first) = iter.next() else {
         return Err(error_message("ERR shard coordination timeout"));
@@ -1180,103 +1179,97 @@ pub async fn script_load_all(script: Bytes) -> Result<String, Vec<u8>> {
 }
 
 pub async fn script_flush_all() -> Result<(), Vec<u8>> {
-    let _guard = scripting_metadata_lock()
-        .lock()
-        .expect("scripting metadata lock poisoned");
-    let bus = query_bus();
-    let (reply_tx, reply_rx) = flume::bounded(bus.shard_count());
-    for shard_id in 0..bus.shard_count() {
-        let _ = bus.sender(shard_id).send(ShardQuery::ScriptFlush {
-            reply: reply_tx.clone(),
-        });
-    }
-    drop(reply_tx);
-    let _ = wait_for_result_replies(reply_rx, bus.shard_count()).await?;
+    run_locked_scripting_query(move |bus| {
+        let (reply_tx, reply_rx) = crossfire::compat::mpmc::bounded_blocking(bus.shard_count());
+        for shard_id in 0..bus.shard_count() {
+            let _ = bus.sender(shard_id).send(ShardQuery::ScriptFlush {
+                reply: reply_tx.clone(),
+            });
+        }
+        drop(reply_tx);
+        wait_for_result_replies_sync(reply_rx, bus.shard_count())
+    })
+    .await?;
     Ok(())
 }
 
 pub async fn function_load_all(source: Bytes, replace: bool) -> Result<(), Vec<u8>> {
-    let _guard = scripting_metadata_lock()
-        .lock()
-        .expect("scripting metadata lock poisoned");
-    let bus = query_bus();
-    let (reply_tx, reply_rx) = flume::bounded(bus.shard_count());
-    for shard_id in 0..bus.shard_count() {
-        let _ = bus.sender(shard_id).send(ShardQuery::FunctionLoad {
-            source: source.clone(),
-            replace,
-            reply: reply_tx.clone(),
-        });
-    }
-    drop(reply_tx);
-    let _ = wait_for_result_replies(reply_rx, bus.shard_count()).await?;
+    run_locked_scripting_query(move |bus| {
+        let (reply_tx, reply_rx) = crossfire::compat::mpmc::bounded_blocking(bus.shard_count());
+        for shard_id in 0..bus.shard_count() {
+            let _ = bus.sender(shard_id).send(ShardQuery::FunctionLoad {
+                source: source.clone(),
+                replace,
+                reply: reply_tx.clone(),
+            });
+        }
+        drop(reply_tx);
+        wait_for_result_replies_sync(reply_rx, bus.shard_count())
+    })
+    .await?;
     Ok(())
 }
 
 pub async fn function_delete_all(library_name: String) -> Result<(), Vec<u8>> {
-    let _guard = scripting_metadata_lock()
-        .lock()
-        .expect("scripting metadata lock poisoned");
-    let bus = query_bus();
-    let (reply_tx, reply_rx) = flume::bounded(bus.shard_count());
-    for shard_id in 0..bus.shard_count() {
-        let _ = bus.sender(shard_id).send(ShardQuery::FunctionDelete {
-            library_name: library_name.clone(),
-            reply: reply_tx.clone(),
-        });
-    }
-    drop(reply_tx);
-    let _ = wait_for_result_replies(reply_rx, bus.shard_count()).await?;
+    run_locked_scripting_query(move |bus| {
+        let (reply_tx, reply_rx) = crossfire::compat::mpmc::bounded_blocking(bus.shard_count());
+        for shard_id in 0..bus.shard_count() {
+            let _ = bus.sender(shard_id).send(ShardQuery::FunctionDelete {
+                library_name: library_name.clone(),
+                reply: reply_tx.clone(),
+            });
+        }
+        drop(reply_tx);
+        wait_for_result_replies_sync(reply_rx, bus.shard_count())
+    })
+    .await?;
     Ok(())
 }
 
 pub async fn function_flush_all() -> Result<(), Vec<u8>> {
-    let _guard = scripting_metadata_lock()
-        .lock()
-        .expect("scripting metadata lock poisoned");
-    let bus = query_bus();
-    let (reply_tx, reply_rx) = flume::bounded(bus.shard_count());
-    for shard_id in 0..bus.shard_count() {
-        let _ = bus.sender(shard_id).send(ShardQuery::FunctionFlush {
-            reply: reply_tx.clone(),
-        });
-    }
-    drop(reply_tx);
-    let _ = wait_for_result_replies(reply_rx, bus.shard_count()).await?;
+    run_locked_scripting_query(move |bus| {
+        let (reply_tx, reply_rx) = crossfire::compat::mpmc::bounded_blocking(bus.shard_count());
+        for shard_id in 0..bus.shard_count() {
+            let _ = bus.sender(shard_id).send(ShardQuery::FunctionFlush {
+                reply: reply_tx.clone(),
+            });
+        }
+        drop(reply_tx);
+        wait_for_result_replies_sync(reply_rx, bus.shard_count())
+    })
+    .await?;
     Ok(())
 }
 
 pub async fn function_restore_all(payload: Bytes, mode: RestoreMode) -> Result<(), Vec<u8>> {
-    let _guard = scripting_metadata_lock()
-        .lock()
-        .expect("scripting metadata lock poisoned");
-    let bus = query_bus();
-    let (reply_tx, reply_rx) = flume::bounded(bus.shard_count());
-    for shard_id in 0..bus.shard_count() {
-        let _ = bus.sender(shard_id).send(ShardQuery::FunctionRestore {
-            payload: payload.clone(),
-            mode,
-            reply: reply_tx.clone(),
-        });
-    }
-    drop(reply_tx);
-    let _ = wait_for_result_replies(reply_rx, bus.shard_count()).await?;
+    run_locked_scripting_query(move |bus| {
+        let (reply_tx, reply_rx) = crossfire::compat::mpmc::bounded_blocking(bus.shard_count());
+        for shard_id in 0..bus.shard_count() {
+            let _ = bus.sender(shard_id).send(ShardQuery::FunctionRestore {
+                payload: payload.clone(),
+                mode,
+                reply: reply_tx.clone(),
+            });
+        }
+        drop(reply_tx);
+        wait_for_result_replies_sync(reply_rx, bus.shard_count())
+    })
+    .await?;
     Ok(())
 }
 
 pub async fn kill_running_script() -> Result<bool, Vec<u8>> {
-    let _guard = scripting_metadata_lock()
-        .lock()
-        .expect("scripting metadata lock poisoned");
-    let bus = query_bus();
-    let (reply_tx, reply_rx) = flume::bounded(bus.shard_count());
-    for shard_id in 0..bus.shard_count() {
-        let _ = bus.sender(shard_id).send(ShardQuery::KillScript {
-            reply: reply_tx.clone(),
-        });
-    }
-    drop(reply_tx);
-    let replies = wait_for_result_replies(reply_rx, bus.shard_count()).await?;
+    let replies = run_locked_scripting_query(move |bus| {
+        let (reply_tx, reply_rx) = crossfire::compat::mpmc::bounded_blocking(bus.shard_count());
+        for shard_id in 0..bus.shard_count() {
+            let _ = bus.sender(shard_id).send(ShardQuery::KillScript {
+                reply: reply_tx.clone(),
+            });
+        }
+        drop(reply_tx);
+        wait_for_result_replies_sync(reply_rx, bus.shard_count())
+    })
+    .await?;
     Ok(replies.into_iter().any(|value| value))
 }
 
@@ -1286,7 +1279,7 @@ pub fn shard_pubsub_subscribe(
     conn_id: u64,
 ) -> Result<Arc<BroadcastSlot>, Vec<u8>> {
     let bus = query_bus();
-    let (reply_tx, reply_rx) = flume::bounded(1);
+    let (reply_tx, reply_rx) = crossfire::compat::mpmc::bounded_blocking(1);
     bus.sender(shard_id)
         .send(ShardQuery::ShardPubSubSubscribe {
             channel,
@@ -1303,7 +1296,7 @@ pub fn shard_pubsub_unsubscribe(
     conn_id: u64,
 ) -> Result<(), Vec<u8>> {
     let bus = query_bus();
-    let (reply_tx, reply_rx) = flume::bounded(1);
+    let (reply_tx, reply_rx) = crossfire::compat::mpmc::bounded_blocking(1);
     bus.sender(shard_id)
         .send(ShardQuery::ShardPubSubUnsubscribe {
             channel,
@@ -1320,7 +1313,7 @@ pub fn shard_pubsub_publish(
     payload: Bytes,
 ) -> Result<u64, Vec<u8>> {
     let bus = query_bus();
-    let (reply_tx, reply_rx) = flume::bounded(1);
+    let (reply_tx, reply_rx) = crossfire::compat::mpmc::bounded_blocking(1);
     bus.sender(shard_id)
         .send(ShardQuery::ShardPubSubPublish {
             channel,
@@ -1333,7 +1326,7 @@ pub fn shard_pubsub_publish(
 
 pub async fn save_rdb_snapshot(config: &SenkoConfig) -> Result<(), String> {
     let bus = query_bus();
-    let (pause_tx, pause_rx) = flume::bounded(bus.shard_count());
+    let (pause_tx, pause_rx) = crossfire::compat::mpmc::bounded_blocking(bus.shard_count());
     for shard_id in 0..bus.shard_count() {
         let _ = bus.sender(shard_id).send(ShardQuery::Pause {
             reply: pause_tx.clone(),
@@ -1346,7 +1339,7 @@ pub async fn save_rdb_snapshot(config: &SenkoConfig) -> Result<(), String> {
 
     let export_result = export_rdb_records().await;
 
-    let (resume_tx, resume_rx) = flume::bounded(bus.shard_count());
+    let (resume_tx, resume_rx) = crossfire::compat::mpmc::bounded_blocking(bus.shard_count());
     for shard_id in 0..bus.shard_count() {
         let _ = bus.sender(shard_id).send(ShardQuery::Resume {
             reply: resume_tx.clone(),
@@ -1373,7 +1366,7 @@ pub async fn save_rdb_snapshot(config: &SenkoConfig) -> Result<(), String> {
 
 async fn export_rdb_records() -> Result<Vec<senko_store::ReplicationSnapshotEntry>, String> {
     let bus = query_bus();
-    let (reply_tx, reply_rx) = flume::bounded(bus.shard_count());
+    let (reply_tx, reply_rx) = crossfire::compat::mpmc::bounded_blocking(bus.shard_count());
     for shard_id in 0..bus.shard_count() {
         let _ = bus.sender(shard_id).send(ShardQuery::ExportRdb {
             reply: reply_tx.clone(),
@@ -1389,8 +1382,8 @@ async fn export_rdb_records() -> Result<Vec<senko_store::ReplicationSnapshotEntr
                 received += 1;
                 out.append(&mut shard_records);
             }
-            Err(flume::TryRecvError::Empty) => compio::time::sleep(Duration::from_millis(1)).await,
-            Err(flume::TryRecvError::Disconnected) => break,
+            Err(TryRecvError::Empty) => compio::time::sleep(Duration::from_millis(1)).await,
+            Err(TryRecvError::Disconnected) => break,
         }
     }
     if received == bus.shard_count() {
@@ -1406,8 +1399,8 @@ async fn wait_for_unit_replies(reply_rx: Receiver<()>, expected: usize) -> Resul
     while received < expected && std::time::Instant::now() < deadline {
         match reply_rx.try_recv() {
             Ok(()) => received += 1,
-            Err(flume::TryRecvError::Empty) => compio::time::sleep(Duration::from_millis(1)).await,
-            Err(flume::TryRecvError::Disconnected) => break,
+            Err(TryRecvError::Empty) => compio::time::sleep(Duration::from_millis(1)).await,
+            Err(TryRecvError::Disconnected) => break,
         }
     }
     if received == expected {
@@ -1417,7 +1410,7 @@ async fn wait_for_unit_replies(reply_rx: Receiver<()>, expected: usize) -> Resul
     }
 }
 
-async fn wait_for_result_replies<T>(
+fn wait_for_result_replies_sync<T: Send + 'static>(
     reply_rx: Receiver<Result<T, String>>,
     expected: usize,
 ) -> Result<Vec<T>, Vec<u8>> {
@@ -1431,8 +1424,8 @@ async fn wait_for_result_replies<T>(
                 out.push(value);
             }
             Ok(Err(error)) => return Err(error_message(&error)),
-            Err(flume::TryRecvError::Empty) => compio::time::sleep(Duration::from_millis(1)).await,
-            Err(flume::TryRecvError::Disconnected) => break,
+            Err(TryRecvError::Empty) => thread::sleep(Duration::from_millis(1)),
+            Err(TryRecvError::Disconnected) => break,
         }
     }
     if received == expected {
@@ -1442,16 +1435,34 @@ async fn wait_for_result_replies<T>(
     }
 }
 
-fn wait_for_single_sync_reply<T>(reply_rx: Receiver<Result<T, String>>) -> Result<T, Vec<u8>> {
+async fn run_locked_scripting_query<T, F>(op: F) -> Result<T, Vec<u8>>
+where
+    T: Send + 'static,
+    F: FnOnce(&Arc<ShardQueryBus>) -> Result<T, Vec<u8>> + Send + 'static,
+{
+    let bus = Arc::clone(query_bus());
+    spawn_blocking(move || {
+        let _guard = scripting_metadata_lock()
+            .lock()
+            .expect("scripting metadata lock poisoned");
+        op(&bus)
+    })
+    .await
+    .map_err(|_| error_message("ERR scripting metadata task failed"))?
+}
+
+fn wait_for_single_sync_reply<T: Send + 'static>(
+    reply_rx: Receiver<Result<T, String>>,
+) -> Result<T, Vec<u8>> {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         match reply_rx.try_recv() {
             Ok(Ok(value)) => return Ok(value),
             Ok(Err(error)) => return Err(error_message(&error)),
-            Err(flume::TryRecvError::Empty) if std::time::Instant::now() < deadline => {
+            Err(TryRecvError::Empty) if std::time::Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(1));
             }
-            Err(flume::TryRecvError::Empty) | Err(flume::TryRecvError::Disconnected) => {
+            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => {
                 return Err(error_message("ERR shard coordination timeout"));
             }
         }

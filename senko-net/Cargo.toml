@@ -18,8 +18,8 @@ ahash.workspace = true
 bytes.workspace = true
 compio.workspace = true
 compact_str.workspace = true
+crossfire.workspace = true
 getrandom = "=0.3.4"
-flume.workspace = true
 futures-util.workspace = true
 hashbrown.workspace = true
 hdrhistogram.workspace = true
