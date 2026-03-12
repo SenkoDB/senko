@@ -21,6 +21,7 @@ use hashbrown::HashMap;
 use senko_cluster::NodeId;
 use senko_core::{ProbMergeValue, SenkoConfig, SenkoValue};
 use senko_proto::Frame;
+use senko_scripting::{LuaEngine, functions::RestoreMode};
 use senko_store::{Response, Store};
 use smallvec::{SmallVec, smallvec};
 
@@ -53,6 +54,7 @@ const PROC_JIFFY_HZ: f64 = 100.0;
 
 static SERVER_STATE: std::sync::OnceLock<Arc<ServerState>> = std::sync::OnceLock::new();
 static QUERY_BUS: std::sync::OnceLock<Arc<ShardQueryBus>> = std::sync::OnceLock::new();
+static SCRIPTING_METADATA_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
 
 #[derive(Debug)]
 pub struct ServerCommandOutcome {
@@ -134,6 +136,33 @@ pub(crate) enum ShardQuery {
     FetchValue {
         key: Vec<u8>,
         reply: Sender<Option<ProbMergeValue>>,
+    },
+    ScriptLoad {
+        script: Bytes,
+        reply: Sender<Result<String, String>>,
+    },
+    ScriptFlush {
+        reply: Sender<Result<(), String>>,
+    },
+    FunctionLoad {
+        source: Bytes,
+        replace: bool,
+        reply: Sender<Result<(), String>>,
+    },
+    FunctionDelete {
+        library_name: String,
+        reply: Sender<Result<(), String>>,
+    },
+    FunctionFlush {
+        reply: Sender<Result<(), String>>,
+    },
+    FunctionRestore {
+        payload: Bytes,
+        mode: RestoreMode,
+        reply: Sender<Result<(), String>>,
+    },
+    KillScript {
+        reply: Sender<Result<bool, String>>,
     },
 }
 
@@ -422,6 +451,10 @@ fn query_bus() -> &'static Arc<ShardQueryBus> {
     QUERY_BUS.get().expect("query bus not initialized")
 }
 
+fn scripting_metadata_lock() -> &'static Mutex<()> {
+    SCRIPTING_METADATA_LOCK.get_or_init(|| Mutex::new(()))
+}
+
 pub(crate) fn take_query_receiver(shard_id: usize) -> Receiver<ShardQuery> {
     query_bus().take_receiver(shard_id)
 }
@@ -430,6 +463,7 @@ pub(crate) fn drain_shard_queries(
     shard_id: usize,
     receiver: &Receiver<ShardQuery>,
     store: &Rc<RefCell<Store>>,
+    engine: &Rc<RefCell<LuaEngine>>,
     blocked: &Rc<RefCell<BlockedKeyRegistry>>,
     client_connections: &Rc<RefCell<ClientConnectionMap>>,
     pause_state: &Rc<RefCell<PauseState>>,
@@ -509,6 +543,75 @@ pub(crate) fn drain_shard_queries(
                     _ => None,
                 };
                 let _ = reply.send(value);
+            }
+            ShardQuery::ScriptLoad { script, reply } => {
+                let result = std::str::from_utf8(script.as_ref())
+                    .map_err(|error| error.to_string())
+                    .and_then(|script| {
+                        engine
+                            .borrow_mut()
+                            .script_load(script)
+                            .map_err(|error| error.client_message())
+                    });
+                let _ = reply.send(result);
+            }
+            ShardQuery::ScriptFlush { reply } => {
+                let result = engine
+                    .borrow_mut()
+                    .script_flush()
+                    .map_err(|error| error.client_message());
+                let _ = reply.send(result);
+            }
+            ShardQuery::FunctionLoad {
+                source,
+                replace,
+                reply,
+            } => {
+                let result = std::str::from_utf8(source.as_ref())
+                    .map_err(|error| error.to_string())
+                    .and_then(|source| {
+                        engine
+                            .borrow_mut()
+                            .function_load(source, replace)
+                            .map_err(|error| error.client_message())
+                    });
+                let _ = reply.send(result);
+            }
+            ShardQuery::FunctionDelete {
+                library_name,
+                reply,
+            } => {
+                let result = engine
+                    .borrow_mut()
+                    .function_delete(library_name.as_str())
+                    .map_err(|error| error.client_message());
+                let _ = reply.send(result);
+            }
+            ShardQuery::FunctionFlush { reply } => {
+                let result = engine
+                    .borrow_mut()
+                    .function_flush()
+                    .map_err(|error| error.client_message());
+                let _ = reply.send(result);
+            }
+            ShardQuery::FunctionRestore {
+                payload,
+                mode,
+                reply,
+            } => {
+                let result = engine
+                    .borrow_mut()
+                    .function_restore(payload.as_ref(), mode)
+                    .map_err(|error| error.client_message());
+                let _ = reply.send(result);
+            }
+            ShardQuery::KillScript { reply } => {
+                let result = match engine.borrow().request_kill() {
+                    Ok(()) => Ok(true),
+                    Err(error) if matches!(error, senko_scripting::LuaError::NotBusy) => Ok(false),
+                    Err(error) => Err(error.client_message()),
+                };
+                let _ = reply.send(result);
             }
         }
     }
@@ -1003,6 +1106,134 @@ pub(crate) fn fetch_prob_merge_values_for_key(
     values
 }
 
+pub async fn script_load_all(script: Bytes) -> Result<String, Vec<u8>> {
+    let _guard = scripting_metadata_lock()
+        .lock()
+        .expect("scripting metadata lock poisoned");
+    let bus = query_bus();
+    let (reply_tx, reply_rx) = flume::bounded(bus.shard_count());
+    for shard_id in 0..bus.shard_count() {
+        let _ = bus.sender(shard_id).send(ShardQuery::ScriptLoad {
+            script: script.clone(),
+            reply: reply_tx.clone(),
+        });
+    }
+    drop(reply_tx);
+    let replies = wait_for_result_replies(reply_rx, bus.shard_count()).await?;
+    let mut iter = replies.into_iter();
+    let Some(first) = iter.next() else {
+        return Err(error_message("ERR shard coordination timeout"));
+    };
+    if iter.all(|value| value == first) {
+        Ok(first)
+    } else {
+        Err(error_message(
+            "ERR inconsistent script cache state across shards",
+        ))
+    }
+}
+
+pub async fn script_flush_all() -> Result<(), Vec<u8>> {
+    let _guard = scripting_metadata_lock()
+        .lock()
+        .expect("scripting metadata lock poisoned");
+    let bus = query_bus();
+    let (reply_tx, reply_rx) = flume::bounded(bus.shard_count());
+    for shard_id in 0..bus.shard_count() {
+        let _ = bus.sender(shard_id).send(ShardQuery::ScriptFlush {
+            reply: reply_tx.clone(),
+        });
+    }
+    drop(reply_tx);
+    let _ = wait_for_result_replies(reply_rx, bus.shard_count()).await?;
+    Ok(())
+}
+
+pub async fn function_load_all(source: Bytes, replace: bool) -> Result<(), Vec<u8>> {
+    let _guard = scripting_metadata_lock()
+        .lock()
+        .expect("scripting metadata lock poisoned");
+    let bus = query_bus();
+    let (reply_tx, reply_rx) = flume::bounded(bus.shard_count());
+    for shard_id in 0..bus.shard_count() {
+        let _ = bus.sender(shard_id).send(ShardQuery::FunctionLoad {
+            source: source.clone(),
+            replace,
+            reply: reply_tx.clone(),
+        });
+    }
+    drop(reply_tx);
+    let _ = wait_for_result_replies(reply_rx, bus.shard_count()).await?;
+    Ok(())
+}
+
+pub async fn function_delete_all(library_name: String) -> Result<(), Vec<u8>> {
+    let _guard = scripting_metadata_lock()
+        .lock()
+        .expect("scripting metadata lock poisoned");
+    let bus = query_bus();
+    let (reply_tx, reply_rx) = flume::bounded(bus.shard_count());
+    for shard_id in 0..bus.shard_count() {
+        let _ = bus.sender(shard_id).send(ShardQuery::FunctionDelete {
+            library_name: library_name.clone(),
+            reply: reply_tx.clone(),
+        });
+    }
+    drop(reply_tx);
+    let _ = wait_for_result_replies(reply_rx, bus.shard_count()).await?;
+    Ok(())
+}
+
+pub async fn function_flush_all() -> Result<(), Vec<u8>> {
+    let _guard = scripting_metadata_lock()
+        .lock()
+        .expect("scripting metadata lock poisoned");
+    let bus = query_bus();
+    let (reply_tx, reply_rx) = flume::bounded(bus.shard_count());
+    for shard_id in 0..bus.shard_count() {
+        let _ = bus.sender(shard_id).send(ShardQuery::FunctionFlush {
+            reply: reply_tx.clone(),
+        });
+    }
+    drop(reply_tx);
+    let _ = wait_for_result_replies(reply_rx, bus.shard_count()).await?;
+    Ok(())
+}
+
+pub async fn function_restore_all(payload: Bytes, mode: RestoreMode) -> Result<(), Vec<u8>> {
+    let _guard = scripting_metadata_lock()
+        .lock()
+        .expect("scripting metadata lock poisoned");
+    let bus = query_bus();
+    let (reply_tx, reply_rx) = flume::bounded(bus.shard_count());
+    for shard_id in 0..bus.shard_count() {
+        let _ = bus.sender(shard_id).send(ShardQuery::FunctionRestore {
+            payload: payload.clone(),
+            mode,
+            reply: reply_tx.clone(),
+        });
+    }
+    drop(reply_tx);
+    let _ = wait_for_result_replies(reply_rx, bus.shard_count()).await?;
+    Ok(())
+}
+
+pub async fn kill_running_script() -> Result<bool, Vec<u8>> {
+    let _guard = scripting_metadata_lock()
+        .lock()
+        .expect("scripting metadata lock poisoned");
+    let bus = query_bus();
+    let (reply_tx, reply_rx) = flume::bounded(bus.shard_count());
+    for shard_id in 0..bus.shard_count() {
+        let _ = bus.sender(shard_id).send(ShardQuery::KillScript {
+            reply: reply_tx.clone(),
+        });
+    }
+    drop(reply_tx);
+    let replies = wait_for_result_replies(reply_rx, bus.shard_count()).await?;
+    Ok(replies.into_iter().any(|value| value))
+}
+
 pub async fn save_rdb_snapshot(config: &SenkoConfig) -> Result<(), String> {
     let bus = query_bus();
     let (pause_tx, pause_rx) = flume::bounded(bus.shard_count());
@@ -1084,6 +1315,31 @@ async fn wait_for_unit_replies(reply_rx: Receiver<()>, expected: usize) -> Resul
     }
     if received == expected {
         Ok(())
+    } else {
+        Err(error_message("ERR shard coordination timeout"))
+    }
+}
+
+async fn wait_for_result_replies<T>(
+    reply_rx: Receiver<Result<T, String>>,
+    expected: usize,
+) -> Result<Vec<T>, Vec<u8>> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut received = 0usize;
+    let mut out = Vec::with_capacity(expected);
+    while received < expected && std::time::Instant::now() < deadline {
+        match reply_rx.try_recv() {
+            Ok(Ok(value)) => {
+                received += 1;
+                out.push(value);
+            }
+            Ok(Err(error)) => return Err(error_message(&error)),
+            Err(flume::TryRecvError::Empty) => compio::time::sleep(Duration::from_millis(1)).await,
+            Err(flume::TryRecvError::Disconnected) => break,
+        }
+    }
+    if received == expected {
+        Ok(out)
     } else {
         Err(error_message("ERR shard coordination timeout"))
     }

@@ -15,19 +15,22 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use compact_str::CompactString;
 use compio::{
     BufResult,
-    io::{AsyncReadManaged, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
-    runtime::BufferPool,
     time::sleep,
 };
 use futures_util::future::poll_fn;
 use futures_util::{FutureExt, pin_mut};
 use senko_core::{SenkoConfig, SenkoError, SenkoResult, SenkoValue, ShardExtensions};
 use senko_proto::{AggregateKind, Frame, ParseStatus, RespParser, RespSerializer};
+use senko_scripting::{
+    LuaEngine, LuaError, RespValue as ScriptRespValue, ScriptContext, ScriptDebugMode,
+    ScriptExecutionHooks,
+};
 use senko_store::{
     Response, Store,
     commands::generic::keys as generic_keys,
@@ -165,6 +168,7 @@ pub struct Connection {
     shard_id: usize,
     stream: TcpStream,
     store: Rc<RefCell<Store>>,
+    engine: Rc<RefCell<LuaEngine>>,
     shard_extensions: Arc<ShardExtensions>,
     blocked: Rc<RefCell<BlockedKeyRegistry>>,
     cluster: Rc<RefCell<ClusterCommandState>>,
@@ -174,7 +178,6 @@ pub struct Connection {
     pause_state: Rc<RefCell<PauseState>>,
     tracking_registry: Rc<RefCell<TrackingRegistry>>,
     shard_pubsub: Rc<RefCell<ShardFanOut>>,
-    buffer_pool: Rc<BufferPool>,
     parse_buffer: BytesMut,
     phase: ConnectionPhase,
     pub(crate) meta: ConnectionMeta,
@@ -207,6 +210,7 @@ impl Connection {
         peer_addr: SocketAddr,
         local_addr: SocketAddr,
         store: Rc<RefCell<Store>>,
+        engine: Rc<RefCell<LuaEngine>>,
         shard_extensions: Arc<ShardExtensions>,
         blocked: Rc<RefCell<BlockedKeyRegistry>>,
         cluster: Rc<RefCell<ClusterCommandState>>,
@@ -216,7 +220,6 @@ impl Connection {
         pause_state: Rc<RefCell<PauseState>>,
         tracking_registry: Rc<RefCell<TrackingRegistry>>,
         shard_pubsub: Rc<RefCell<ShardFanOut>>,
-        buffer_pool: Rc<BufferPool>,
         _config: &SenkoConfig,
     ) -> Self {
         let watch_state = Rc::new(RefCell::new(WatchState::default()));
@@ -274,6 +277,7 @@ impl Connection {
             shard_id,
             stream,
             store,
+            engine,
             shard_extensions,
             blocked,
             cluster,
@@ -283,7 +287,6 @@ impl Connection {
             pause_state,
             tracking_registry,
             shard_pubsub,
-            buffer_pool,
             parse_buffer: BytesMut::with_capacity(READ_CHUNK_SIZE),
             phase: ConnectionPhase::Reading,
             meta,
@@ -338,6 +341,7 @@ impl Connection {
                             frame,
                             &mut self.meta,
                             &self.store,
+                            &self.engine,
                             &self.shard_extensions,
                             &self.blocked,
                             &self.cluster,
@@ -463,19 +467,17 @@ impl Connection {
 
     async fn wait_for_activity(&mut self) -> SenkoResult<Activity> {
         if self.pubsub.is_none() && self.monitor.is_none() {
-            let read = self
-                .stream
-                .read_managed(self.buffer_pool.as_ref(), READ_CHUNK_SIZE)
-                .await?;
-            return Ok(Activity::Socket(read.to_vec()));
+            let BufResult(result, read) =
+                self.stream.read(Vec::with_capacity(READ_CHUNK_SIZE)).await;
+            result?;
+            return Ok(Activity::Socket(read));
         }
 
         let stream = &mut self.stream;
-        let pool = Rc::clone(&self.buffer_pool);
         if let Some(state) = self.pubsub.as_ref() {
             let read_fut = stream
-                .read_managed(pool.as_ref(), READ_CHUNK_SIZE)
-                .map(|result| result.map(|read| Activity::Socket(read.to_vec())));
+                .read(Vec::with_capacity(READ_CHUNK_SIZE))
+                .map(|BufResult(result, read)| result.map(|_| Activity::Socket(read)));
             let pubsub_fut = poll_fn(|cx| state.poll_ready(cx)).map(|_| Ok(Activity::PubSub));
             pin_mut!(read_fut, pubsub_fut);
             return match futures_util::future::select(read_fut, pubsub_fut).await {
@@ -484,8 +486,8 @@ impl Connection {
             };
         }
         let read_fut = stream
-            .read_managed(pool.as_ref(), READ_CHUNK_SIZE)
-            .map(|result| result.map(|read| Activity::Socket(read.to_vec())));
+            .read(Vec::with_capacity(READ_CHUNK_SIZE))
+            .map(|BufResult(result, read)| result.map(|_| Activity::Socket(read)));
         let monitor_fut = sleep(Duration::from_millis(10)).map(|_| Ok(Activity::Monitor));
         pin_mut!(read_fut, monitor_fut);
         match futures_util::future::select(read_fut, monitor_fut).await {
@@ -593,6 +595,7 @@ async fn handle_frame(
     frame: Frame<'_>,
     meta: &mut ConnectionMeta,
     store: &Rc<RefCell<Store>>,
+    engine: &Rc<RefCell<LuaEngine>>,
     shard_extensions: &Arc<ShardExtensions>,
     blocked: &Rc<RefCell<BlockedKeyRegistry>>,
     cluster: &Rc<RefCell<ClusterCommandState>>,
@@ -616,6 +619,7 @@ async fn handle_frame(
         frame,
         meta,
         store,
+        engine,
         shard_extensions,
         blocked,
         cluster,
@@ -662,6 +666,7 @@ async fn dispatch_frame(
     frame: Frame<'_>,
     meta: &mut ConnectionMeta,
     store: &Rc<RefCell<Store>>,
+    engine: &Rc<RefCell<LuaEngine>>,
     shard_extensions: &Arc<ShardExtensions>,
     blocked: &Rc<RefCell<BlockedKeyRegistry>>,
     cluster: &Rc<RefCell<ClusterCommandState>>,
@@ -771,6 +776,7 @@ async fn dispatch_frame(
                     queued_command.frames[0].as_ref(),
                     &queued_frames[1..],
                     store,
+                    engine,
                     shard_extensions,
                     blocked,
                     cluster,
@@ -814,6 +820,7 @@ async fn dispatch_frame(
                 command,
                 args,
                 store,
+                engine,
                 shard_extensions,
                 blocked,
                 cluster,
@@ -848,6 +855,7 @@ async fn dispatch_frame(
         command,
         args,
         store,
+        engine,
         shard_extensions,
         blocked,
         cluster,
@@ -875,6 +883,7 @@ async fn execute_immediate_command(
     command: &[u8],
     args: &[Frame<'_>],
     store: &Rc<RefCell<Store>>,
+    engine: &Rc<RefCell<LuaEngine>>,
     shard_extensions: &Arc<ShardExtensions>,
     blocked: &Rc<RefCell<BlockedKeyRegistry>>,
     cluster: &Rc<RefCell<ClusterCommandState>>,
@@ -984,6 +993,24 @@ async fn execute_immediate_command(
                 )
             })
             .map_err(ConnectionControl::Continue);
+    }
+
+    if let Some(result) = dispatch_scripting_command(
+        meta,
+        command,
+        args,
+        store,
+        engine,
+        blocked,
+        watch_registry,
+        connections,
+        client_connections,
+        tracking_registry,
+        config,
+    )
+    .await
+    {
+        return result.map_err(ConnectionControl::Continue);
     }
 
     if let Some(result) = server_info::execute(
@@ -1205,6 +1232,539 @@ async fn execute_immediate_command(
         }
         Err(error) => Err(ConnectionControl::Continue(error_bytes(&error))),
     }
+}
+
+struct ScriptRuntimeAdapter<'a> {
+    meta: &'a ConnectionMeta,
+    store: &'a Rc<RefCell<Store>>,
+    blocked: &'a Rc<RefCell<BlockedKeyRegistry>>,
+    watch_registry: &'a Rc<RefCell<WatchRegistry>>,
+    connections: &'a Rc<RefCell<ConnectionMap>>,
+    client_connections: &'a Rc<RefCell<ClientConnectionMap>>,
+    tracking_registry: &'a Rc<RefCell<TrackingRegistry>>,
+}
+
+impl ScriptExecutionHooks for ScriptRuntimeAdapter<'_> {
+    fn dispatch(&mut self, command: &[u8], args: &[Bytes]) -> Result<ScriptRespValue, LuaError> {
+        let frames = bytes_to_frames(args);
+        let response = {
+            let mut store_ref = self.store.borrow_mut();
+            let restore_no_touch = store_ref.no_touch();
+            store_ref.set_no_touch(self.meta.no_touch);
+            let response = dispatch::dispatch(&mut store_ref, command, &frames);
+            store_ref.set_no_touch(restore_no_touch);
+            response
+        }
+        .map_err(|error| LuaError::Message(error_message_text(&error)))?;
+        {
+            let mut store_ref = self.store.borrow_mut();
+            let restore_no_touch = store_ref.no_touch();
+            store_ref.set_no_touch(self.meta.no_touch);
+            post_dispatch_notify(
+                command,
+                &frames,
+                &response,
+                &mut store_ref,
+                self.blocked,
+                self.watch_registry,
+                self.connections,
+            );
+            store_ref.set_no_touch(restore_no_touch);
+        }
+        let keys = notification_keys(command, &frames, &response);
+        client_ops::invalidate_written_keys(
+            &keys,
+            self.meta.id,
+            self.tracking_registry,
+            self.client_connections,
+        );
+        Ok(response_to_script_value(&response))
+    }
+
+    fn acl_check(
+        &mut self,
+        _username: &str,
+        command: &[u8],
+        args: &[Bytes],
+    ) -> Result<(), LuaError> {
+        let frames = bytes_to_frames(args);
+        acl::check_permissions(self.meta, command, &frames, AclContext::Toplevel, 0)
+            .map_err(|bytes| LuaError::Message(resp_error_to_text(&bytes)))
+    }
+
+    fn log(&mut self, level: i64, message: &str) {
+        match level {
+            0 => tracing::debug!(target = "senko.scripting", "{message}"),
+            1 => tracing::info!(target = "senko.scripting", "{message}"),
+            2 => tracing::info!(target = "senko.scripting", "{message}"),
+            _ => tracing::warn!(target = "senko.scripting", "{message}"),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_scripting_command(
+    meta: &ConnectionMeta,
+    command: &[u8],
+    args: &[Frame<'_>],
+    store: &Rc<RefCell<Store>>,
+    engine: &Rc<RefCell<LuaEngine>>,
+    blocked: &Rc<RefCell<BlockedKeyRegistry>>,
+    watch_registry: &Rc<RefCell<WatchRegistry>>,
+    connections: &Rc<RefCell<ConnectionMap>>,
+    client_connections: &Rc<RefCell<ClientConnectionMap>>,
+    tracking_registry: &Rc<RefCell<TrackingRegistry>>,
+    config: &SenkoConfig,
+) -> Option<Result<(Vec<u8>, bool, bool, bool), Vec<u8>>> {
+    if eq_ascii(command, b"EVAL")
+        || eq_ascii(command, b"EVALSHA")
+        || eq_ascii(command, b"EVAL_RO")
+        || eq_ascii(command, b"EVALSHA_RO")
+        || eq_ascii(command, b"FCALL")
+        || eq_ascii(command, b"FCALL_RO")
+    {
+        let readonly = eq_ascii(command, b"EVAL_RO")
+            || eq_ascii(command, b"EVALSHA_RO")
+            || eq_ascii(command, b"FCALL_RO");
+        let result = match parse_script_invocation(args) {
+            Ok((head, keys, argv)) => {
+                if config.cluster_enabled
+                    && let Err(error) = validate_script_keys(&keys)
+                {
+                    return Some(Err(error));
+                }
+                let mut runtime = ScriptRuntimeAdapter {
+                    meta,
+                    store,
+                    blocked,
+                    watch_registry,
+                    connections,
+                    client_connections,
+                    tracking_registry,
+                };
+                let context = ScriptContext {
+                    keys: &keys,
+                    args: &argv,
+                    readonly,
+                    db_id: meta.db,
+                    username: meta.username.as_str(),
+                    hooks: &mut runtime,
+                };
+                if eq_ascii(command, b"EVAL") || eq_ascii(command, b"EVAL_RO") {
+                    let sha = match server_info::script_load_all(head.clone()).await {
+                        Ok(sha) => sha,
+                        Err(error) => return Some(Err(error)),
+                    };
+                    engine.borrow_mut().evalsha(sha.as_str(), context)
+                } else if eq_ascii(command, b"EVALSHA") || eq_ascii(command, b"EVALSHA_RO") {
+                    let sha1 = String::from_utf8_lossy(head.as_ref()).into_owned();
+                    engine.borrow_mut().evalsha(sha1.as_str(), context)
+                } else {
+                    let name = String::from_utf8_lossy(head.as_ref()).into_owned();
+                    engine.borrow_mut().fcall(name.as_str(), context)
+                }
+            }
+            Err(error) => Err(LuaError::Message(resp_error_to_text(&error))),
+        };
+        return Some(
+            result
+                .map(|value| {
+                    (
+                        serialize_script_response(&value, meta.resp_version == 3),
+                        false,
+                        false,
+                        false,
+                    )
+                })
+                .map_err(|error| error_message(&error.client_message())),
+        );
+    }
+
+    if eq_ascii(command, b"SCRIPT") {
+        return Some(dispatch_script_meta(meta, args, engine).await);
+    }
+    if eq_ascii(command, b"FUNCTION") {
+        return Some(dispatch_function_meta(meta, args, engine).await);
+    }
+    None
+}
+
+async fn dispatch_script_meta(
+    meta: &ConnectionMeta,
+    args: &[Frame<'_>],
+    engine: &Rc<RefCell<LuaEngine>>,
+) -> Result<(Vec<u8>, bool, bool, bool), Vec<u8>> {
+    let Some((subcommand, rest)) = args.split_first() else {
+        return Err(error_message(
+            "ERR wrong number of arguments for 'script' command",
+        ));
+    };
+    let subcommand = frame_bytes(subcommand).map_err(|error| error_bytes(&error))?;
+    if eq_ascii(subcommand, b"LOAD") {
+        let [script] = rest else {
+            return Err(error_message(
+                "ERR wrong number of arguments for 'script|load' command",
+            ));
+        };
+        let script =
+            Bytes::copy_from_slice(frame_bytes(script).map_err(|error| error_bytes(&error))?);
+        let sha = server_info::script_load_all(script).await?;
+        return Ok((bulk_string(sha.as_bytes()), false, false, false));
+    }
+    if eq_ascii(subcommand, b"EXISTS") {
+        let sha1s = rest
+            .iter()
+            .map(|frame| frame_bytes(frame).map_err(|error| error_bytes(&error)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let sha1s = sha1s
+            .iter()
+            .map(|sha| std::str::from_utf8(sha).unwrap_or_default())
+            .collect::<Vec<_>>();
+        let result = engine.borrow().script_exists(&sha1s);
+        let values = ScriptRespValue::Array(
+            result
+                .into_iter()
+                .map(|exists| ScriptRespValue::Integer(i64::from(exists)))
+                .collect(),
+        );
+        return Ok((
+            serialize_script_response(&values, meta.resp_version == 3),
+            false,
+            false,
+            false,
+        ));
+    }
+    if eq_ascii(subcommand, b"FLUSH") {
+        server_info::script_flush_all().await?;
+        return Ok((simple_string(b"OK"), false, false, false));
+    }
+    if eq_ascii(subcommand, b"DEBUG") {
+        let Some(mode) = rest.first() else {
+            return Err(error_message(
+                "ERR wrong number of arguments for 'script|debug' command",
+            ));
+        };
+        let mode = frame_bytes(mode).map_err(|error| error_bytes(&error))?;
+        let debug_mode = if eq_ascii(mode, b"YES") {
+            ScriptDebugMode::Yes
+        } else if eq_ascii(mode, b"SYNC") {
+            ScriptDebugMode::Sync
+        } else if eq_ascii(mode, b"NO") {
+            ScriptDebugMode::No
+        } else {
+            return Err(error_message("ERR syntax error"));
+        };
+        engine.borrow_mut().set_debug_mode(debug_mode);
+        return Ok((simple_string(b"OK"), false, false, false));
+    }
+    if eq_ascii(subcommand, b"KILL") {
+        if !server_info::kill_running_script().await? {
+            return Err(error_message("NOTBUSY No scripts in execution right now"));
+        }
+        return Ok((simple_string(b"OK"), false, false, false));
+    }
+    Err(error_message(
+        "ERR unknown subcommand or wrong number of arguments for 'script'",
+    ))
+}
+
+async fn dispatch_function_meta(
+    meta: &ConnectionMeta,
+    args: &[Frame<'_>],
+    engine: &Rc<RefCell<LuaEngine>>,
+) -> Result<(Vec<u8>, bool, bool, bool), Vec<u8>> {
+    let Some((subcommand, rest)) = args.split_first() else {
+        return Err(error_message(
+            "ERR wrong number of arguments for 'function' command",
+        ));
+    };
+    let subcommand = frame_bytes(subcommand).map_err(|error| error_bytes(&error))?;
+    if eq_ascii(subcommand, b"LOAD") {
+        let (replace, code_frame) = match rest {
+            [code] => (false, code),
+            [flag, code]
+                if eq_ascii(
+                    frame_bytes(flag).map_err(|error| error_bytes(&error))?,
+                    b"REPLACE",
+                ) =>
+            {
+                (true, code)
+            }
+            _ => {
+                return Err(error_message(
+                    "ERR wrong number of arguments for 'function|load' command",
+                ));
+            }
+        };
+        let code =
+            Bytes::copy_from_slice(frame_bytes(code_frame).map_err(|error| error_bytes(&error))?);
+        server_info::function_load_all(code, replace).await?;
+        return Ok((simple_string(b"OK"), false, false, false));
+    }
+    if eq_ascii(subcommand, b"LIST") {
+        let mut pattern = None;
+        let mut with_code = false;
+        let mut index = 0usize;
+        while index < rest.len() {
+            let token = frame_bytes(&rest[index]).map_err(|error| error_bytes(&error))?;
+            if eq_ascii(token, b"WITHCODE") {
+                with_code = true;
+                index += 1;
+            } else if eq_ascii(token, b"LIBRARYNAME") && index + 1 < rest.len() {
+                pattern = Some(frame_bytes(&rest[index + 1]).map_err(|error| error_bytes(&error))?);
+                index += 2;
+            } else {
+                return Err(error_message("ERR syntax error"));
+            }
+        }
+        let list = engine.borrow().function_list(pattern, with_code);
+        let value = ScriptRespValue::Array(list.into_iter().map(library_info_to_script).collect());
+        return Ok((
+            serialize_script_response(&value, meta.resp_version == 3),
+            false,
+            false,
+            false,
+        ));
+    }
+    if eq_ascii(subcommand, b"DELETE") {
+        let [name] = rest else {
+            return Err(error_message(
+                "ERR wrong number of arguments for 'function|delete' command",
+            ));
+        };
+        let name = std::str::from_utf8(frame_bytes(name).map_err(|error| error_bytes(&error))?)
+            .map_err(|_| error_message("ERR library name is not valid UTF-8"))?;
+        server_info::function_delete_all(name.to_owned()).await?;
+        return Ok((simple_string(b"OK"), false, false, false));
+    }
+    if eq_ascii(subcommand, b"FLUSH") {
+        server_info::function_flush_all().await?;
+        return Ok((simple_string(b"OK"), false, false, false));
+    }
+    if eq_ascii(subcommand, b"STATS") {
+        let value = engine.borrow().function_stats(None);
+        return Ok((
+            serialize_script_response(&value, meta.resp_version == 3),
+            false,
+            false,
+            false,
+        ));
+    }
+    if eq_ascii(subcommand, b"DUMP") {
+        let bytes = engine.borrow().function_dump();
+        return Ok((bulk_string(bytes.as_ref()), false, false, false));
+    }
+    if eq_ascii(subcommand, b"RESTORE") {
+        let [payload, mode] = rest else {
+            return Err(error_message(
+                "ERR wrong number of arguments for 'function|restore' command",
+            ));
+        };
+        let payload = frame_bytes(payload).map_err(|error| error_bytes(&error))?;
+        let mode = frame_bytes(mode).map_err(|error| error_bytes(&error))?;
+        let mode = if eq_ascii(mode, b"FLUSH") {
+            senko_scripting::functions::RestoreMode::Flush
+        } else if eq_ascii(mode, b"APPEND") {
+            senko_scripting::functions::RestoreMode::Append
+        } else if eq_ascii(mode, b"REPLACE") {
+            senko_scripting::functions::RestoreMode::Replace
+        } else {
+            return Err(error_message("ERR syntax error"));
+        };
+        server_info::function_restore_all(Bytes::copy_from_slice(payload), mode).await?;
+        return Ok((simple_string(b"OK"), false, false, false));
+    }
+    if eq_ascii(subcommand, b"KILL") {
+        if !server_info::kill_running_script().await? {
+            return Err(error_message("NOTBUSY No scripts in execution right now"));
+        }
+        return Ok((simple_string(b"OK"), false, false, false));
+    }
+    Err(error_message(
+        "ERR unknown subcommand or wrong number of arguments for 'function'",
+    ))
+}
+
+fn parse_script_invocation(args: &[Frame<'_>]) -> Result<(Bytes, Vec<Bytes>, Vec<Bytes>), Vec<u8>> {
+    if args.len() < 2 {
+        return Err(error_message(
+            "ERR wrong number of arguments for scripting command",
+        ));
+    }
+    let head = Bytes::copy_from_slice(frame_bytes(&args[0]).map_err(|error| error_bytes(&error))?);
+    let numkeys = std::str::from_utf8(frame_bytes(&args[1]).map_err(|error| error_bytes(&error))?)
+        .ok()
+        .and_then(|text| text.parse::<usize>().ok())
+        .ok_or_else(|| error_message("ERR value is not an integer or out of range"))?;
+    if args.len() < 2 + numkeys {
+        return Err(error_message("ERR syntax error"));
+    }
+    let keys = args[2..2 + numkeys]
+        .iter()
+        .map(|frame| {
+            frame_bytes(frame)
+                .map(Bytes::copy_from_slice)
+                .map_err(|error| error_bytes(&error))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let argv = args[2 + numkeys..]
+        .iter()
+        .map(|frame| {
+            frame_bytes(frame)
+                .map(Bytes::copy_from_slice)
+                .map_err(|error| error_bytes(&error))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((head, keys, argv))
+}
+
+fn validate_script_keys(keys: &[Bytes]) -> Result<(), Vec<u8>> {
+    let Some(first) = keys.first() else {
+        return Ok(());
+    };
+    let slot = senko_cluster::crc16_slot(first.as_ref() as &[u8]);
+    for key in &keys[1..] {
+        if senko_cluster::crc16_slot(key.as_ref() as &[u8]) != slot {
+            return Err(error_message(
+                "CROSSSLOT Keys in request don't hash to the same slot",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn bytes_to_frames<'a>(args: &'a [Bytes]) -> Vec<Frame<'a>> {
+    args.iter()
+        .map(|arg: &'a Bytes| Frame::BulkString(arg.as_ref()))
+        .collect()
+}
+
+fn response_to_script_value(response: &Response) -> ScriptRespValue {
+    match response {
+        Response::Simple(value) => ScriptRespValue::Simple(Bytes::copy_from_slice(value)),
+        Response::Value(Some(SenkoValue::Raw(value))) => ScriptRespValue::Bulk(Some(value.clone())),
+        Response::Value(Some(SenkoValue::Int(value))) => ScriptRespValue::Integer(*value),
+        Response::Value(Some(SenkoValue::Float(value))) => {
+            ScriptRespValue::Integer(value.trunc() as i64)
+        }
+        Response::Value(Some(value)) => {
+            ScriptRespValue::Bulk(Some(Bytes::copy_from_slice(value.as_bytes().as_ref())))
+        }
+        Response::Value(None) | Response::NullArray => ScriptRespValue::Bulk(None),
+        Response::Integer(value) => ScriptRespValue::Integer(*value),
+        Response::Array(values) => {
+            ScriptRespValue::Array(values.iter().map(response_to_script_value).collect())
+        }
+        Response::Map(values) => {
+            let mut pairs = Vec::new();
+            let mut iter = values.iter();
+            while let Some(key) = iter.next() {
+                let Some(value) = iter.next() else {
+                    break;
+                };
+                pairs.push((
+                    response_to_script_value(key),
+                    response_to_script_value(value),
+                ));
+            }
+            ScriptRespValue::Map(pairs)
+        }
+    }
+}
+
+fn library_info_to_script(info: senko_scripting::LibraryInfo) -> ScriptRespValue {
+    let mut functions = Vec::new();
+    for function in info.functions {
+        functions.push(ScriptRespValue::Map(vec![
+            (bulk_script(b"name"), bulk_script(function.name.as_bytes())),
+            (
+                bulk_script(b"description"),
+                match function.description {
+                    Some(description) => bulk_script(description.as_bytes()),
+                    None => ScriptRespValue::Bulk(None),
+                },
+            ),
+            (
+                bulk_script(b"flags"),
+                ScriptRespValue::Array(
+                    function
+                        .flags
+                        .into_iter()
+                        .map(|flag| bulk_script(flag.as_bytes()))
+                        .collect(),
+                ),
+            ),
+        ]));
+    }
+    let mut map = vec![
+        (
+            bulk_script(b"library_name"),
+            bulk_script(info.library_name.as_bytes()),
+        ),
+        (bulk_script(b"engine"), bulk_script(info.engine.as_bytes())),
+        (bulk_script(b"functions"), ScriptRespValue::Array(functions)),
+    ];
+    if let Some(code) = info.library_code {
+        map.push((
+            bulk_script(b"library_code"),
+            ScriptRespValue::Bulk(Some(code)),
+        ));
+    }
+    ScriptRespValue::Map(map)
+}
+
+fn bulk_script(bytes: &[u8]) -> ScriptRespValue {
+    ScriptRespValue::Bulk(Some(Bytes::copy_from_slice(bytes)))
+}
+
+fn serialize_script_response(value: &ScriptRespValue, resp3: bool) -> Vec<u8> {
+    let mut out = BytesMut::new();
+    write_script_response(&mut out, value, resp3);
+    out.to_vec()
+}
+
+fn write_script_response(out: &mut BytesMut, value: &ScriptRespValue, resp3: bool) {
+    match value {
+        ScriptRespValue::Simple(value) => RespSerializer::write_simple_string(out, value),
+        ScriptRespValue::Error(value) => RespSerializer::write_error(out, value),
+        ScriptRespValue::Bulk(Some(value)) => RespSerializer::write_bulk_string(out, value),
+        ScriptRespValue::Bulk(None) => {
+            if resp3 {
+                RespSerializer::write_null(out);
+            } else {
+                RespSerializer::write_nil_bulk(out);
+            }
+        }
+        ScriptRespValue::Integer(value) => RespSerializer::write_integer(out, *value),
+        ScriptRespValue::Array(values) => {
+            RespSerializer::write_array_header(out, values.len());
+            for value in values {
+                write_script_response(out, value, resp3);
+            }
+        }
+        ScriptRespValue::Map(values) => {
+            if resp3 {
+                RespSerializer::write_raw_map_header(out, values.len());
+                for (key, value) in values {
+                    write_script_response(out, key, resp3);
+                    write_script_response(out, value, resp3);
+                }
+            } else {
+                RespSerializer::write_array_header(out, values.len() * 2);
+                for (key, value) in values {
+                    write_script_response(out, key, resp3);
+                    write_script_response(out, value, resp3);
+                }
+            }
+        }
+    }
+}
+
+fn resp_error_to_text(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    text.trim_start_matches('-')
+        .trim_end_matches("\r\n")
+        .to_owned()
 }
 
 fn diagnostics_command(frame: Frame<'_>) -> Option<(Vec<u8>, Vec<Frame<'_>>)> {

@@ -32,6 +32,7 @@ senko-cluster = { path = "../senko-cluster" }
 senko-core = { path = "../senko-core" }
 senko-pubsub = { path = "../senko-pubsub" }
 senko-proto = { path = "../senko-proto" }
+senko-scripting = { path = "../senko-scripting" }
 senko-store = { path = "../senko-store" }
 socket2.workspace = true
 tracing.workspace = true

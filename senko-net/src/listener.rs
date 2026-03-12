@@ -10,11 +10,14 @@ use std::{
 
 use compio::{
     net::{SocketOpts, TcpListener},
-    runtime::{BufferPool, JoinHandle, spawn},
+    runtime::{JoinHandle, spawn},
     time::interval,
 };
 use futures_util::{StreamExt, stream::FuturesUnordered};
-use senko_core::{ModuleRegistry, SenkoConfig, SenkoResult, ShardExtensions, ShardState};
+use senko_core::{
+    ModuleRegistry, SenkoConfig, SenkoError, SenkoResult, ShardExtensions, ShardState,
+};
+use senko_scripting::{LuaEngine, ScriptingConfig};
 use senko_store::Store;
 use socket2::{Domain, Protocol, Socket, Type};
 use tracing::debug;
@@ -90,6 +93,13 @@ pub async fn run_shard(
     server_info::init(&config);
     let listener = prepared.into_compio()?;
     let store = Rc::new(RefCell::new(Store::new(config.max_memory)));
+    let engine = Rc::new(RefCell::new(
+        LuaEngine::new(&ScriptingConfig {
+            max_depth: 1,
+            time_limit_ms: config.lua_time_limit,
+        })
+        .map_err(|error| SenkoError::ProtocolMessage(error.client_message().into()))?,
+    ));
     let shard_extensions = Arc::new(ShardExtensions::default());
     let mut shard_state = ShardState::new(shard_index, Arc::clone(&shard_extensions));
     module_registry.init_shard(&mut shard_state);
@@ -107,7 +117,6 @@ pub async fn run_shard(
         shard_index,
         Arc::clone(CROSS_SHARD_BUS.get_or_init(|| Arc::new(CrossShardBus::new(config.num_shards)))),
     )));
-    let buffer_pool = Rc::new(BufferPool::new(256, 16 * 1024)?);
     let query_receiver = server_info::take_query_receiver(shard_index);
     let accept_opts = SocketOpts::new()
         .keepalive(config.tcp_keepalive > 0)
@@ -120,6 +129,7 @@ pub async fn run_shard(
     let shard_pubsub_tick = Rc::clone(&shard_pubsub);
     let query_store = Rc::clone(&store);
     let query_blocked = Rc::clone(&blocked);
+    let query_engine = Rc::clone(&engine);
     let query_connections = Rc::clone(&client_connections);
     let query_pause = Rc::clone(&pause_state);
     let query_watch_registry = Rc::clone(&watch_registry);
@@ -150,6 +160,7 @@ pub async fn run_shard(
                 shard_index,
                 &query_receiver,
                 &query_store,
+                &query_engine,
                 &query_blocked,
                 &query_connections,
                 &query_pause,
@@ -185,6 +196,7 @@ pub async fn run_shard(
             peer_addr,
             local_addr,
             Rc::clone(&store),
+            Rc::clone(&engine),
             Arc::clone(&shard_extensions),
             Rc::clone(&blocked),
             Rc::clone(&cluster),
@@ -194,7 +206,6 @@ pub async fn run_shard(
             Rc::clone(&pause_state),
             Rc::clone(&tracking_registry),
             Rc::clone(&shard_pubsub),
-            Rc::clone(&buffer_pool),
             &config,
         );
         let config = config.clone();

@@ -6,6 +6,7 @@ members = [
   "senko-ts",
   "senko-core",
   "senko-proto",
+  "senko-scripting",
   "senko-store",
   "senko-net",
   "senko-server",
