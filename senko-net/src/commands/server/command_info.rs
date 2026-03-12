@@ -163,6 +163,15 @@ pub fn unsubscribe_monitor(subscription: &MonitorSubscription) {
     }
 }
 
+pub(crate) fn is_write_command(command: &[u8]) -> bool {
+    let Ok(name) = std::str::from_utf8(command).map(str::to_ascii_lowercase) else {
+        return false;
+    };
+    registry()
+        .lookup(&name)
+        .is_some_and(|meta| meta.flags.contains(&"write"))
+}
+
 fn command_monitor(
     args: &[Frame<'_>],
     meta: &mut ConnectionMeta,

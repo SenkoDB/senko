@@ -9,7 +9,7 @@ use senko_proto::{Frame, RespSerializer};
 
 use crate::{
     SharedRuntime,
-    config::{MasterConfig, flush_config_atomic},
+    config::{MasterConfig, apply_global_override, flush_config_atomic},
     current_unix_ms, current_unix_us,
     failover::{advance_failover, begin_failover},
     state::{
@@ -113,8 +113,10 @@ fn sentinel_subcommand(
         "MONITOR" => monitor_master(out, runtime, args),
         "REMOVE" => remove_master(out, runtime, required_arg(args, 1)?),
         "SET" => set_master_option(out, runtime, args),
+        "CONFIG" => sentinel_config_subcommand(out, runtime, &args[1..]),
         "INFO-CACHE" => write_info_cache(out, runtime, &args[1..]),
         "PENDING-SCRIPTS" => write_pending_scripts(out, runtime),
+        "HELP" => write_sentinel_help(out),
         "MYID" => {
             let id = runtime.borrow().my_id();
             RespSerializer::write_bulk_string(out, id.as_bytes());
@@ -126,6 +128,151 @@ fn sentinel_subcommand(
             Ok(())
         }
     }
+}
+
+fn sentinel_config_subcommand(
+    out: &mut BytesMut,
+    runtime: &SharedRuntime,
+    args: &[&[u8]],
+) -> SenkoResult<()> {
+    let Some(subcommand) = args.first() else {
+        RespSerializer::write_error(
+            out,
+            b"ERR wrong number of arguments for 'sentinel|config' command",
+        );
+        return Ok(());
+    };
+    match ascii_upper(subcommand).as_str() {
+        "GET" => sentinel_config_get(out, runtime, &args[1..]),
+        "SET" => sentinel_config_set_command(out, runtime, &args[1..]),
+        _ => {
+            RespSerializer::write_error(out, b"ERR unknown sentinel config subcommand");
+            Ok(())
+        }
+    }
+}
+
+fn sentinel_config_get(
+    out: &mut BytesMut,
+    runtime: &SharedRuntime,
+    args: &[&[u8]],
+) -> SenkoResult<()> {
+    let [pattern] = args else {
+        RespSerializer::write_error(
+            out,
+            b"ERR wrong number of arguments for 'sentinel|config|get' command",
+        );
+        return Ok(());
+    };
+    let pattern = std::str::from_utf8(pattern)?;
+    let config = &runtime.borrow().config;
+    let entries = sentinel_config_entries(config);
+    let matches = entries
+        .into_iter()
+        .filter(|(name, _)| glob_matches(pattern, name))
+        .collect::<Vec<_>>();
+    RespSerializer::write_array_header(out, matches.len() * 2);
+    for (name, value) in matches {
+        RespSerializer::write_bulk_string(out, name.as_bytes());
+        RespSerializer::write_bulk_string(out, value.as_bytes());
+    }
+    Ok(())
+}
+
+fn sentinel_config_set_command(
+    out: &mut BytesMut,
+    runtime: &SharedRuntime,
+    args: &[&[u8]],
+) -> SenkoResult<()> {
+    let [option, value] = args else {
+        RespSerializer::write_error(
+            out,
+            b"ERR wrong number of arguments for 'sentinel|config|set' command",
+        );
+        return Ok(());
+    };
+    let option = std::str::from_utf8(option)?.to_owned();
+    let value = std::str::from_utf8(value)?.to_owned();
+    let runtime_ref = &mut *runtime.borrow_mut();
+    let original = runtime_ref.config.clone();
+    if let Err(error) = apply_global_override(&mut runtime_ref.config, &option, &value) {
+        runtime_ref.config = original;
+        return Err(config_error(error));
+    }
+    if option.eq_ignore_ascii_case("sentinel-hz") {
+        runtime_ref
+            .monitor
+            .set_sentinel_hz_ms(runtime_ref.config.sentinel_hz() as u64);
+    }
+    let snapshot = runtime_ref.snapshot();
+    flush_config_atomic(&runtime_ref.config, &snapshot).map_err(config_error)?;
+    RespSerializer::write_simple_string(out, b"OK");
+    Ok(())
+}
+
+fn sentinel_config_entries(config: &crate::config::SentinelConfig) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "announce-hostnames",
+            yes_no(config.network.announce_hostnames),
+        ),
+        (
+            "announce-ip",
+            config.network.announce_ip.clone().unwrap_or_default(),
+        ),
+        (
+            "announce-port",
+            config
+                .network
+                .announce_port
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        ),
+        (
+            "loglevel",
+            format!("{:?}", config.general.loglevel).to_ascii_lowercase(),
+        ),
+        (
+            "resolve-hostnames",
+            yes_no(config.network.resolve_hostnames),
+        ),
+        ("sentinel-hz", config.general.sentinel_hz.to_string()),
+        (
+            "sentinel-pass",
+            config.security.sentinel_pass.clone().unwrap_or_default(),
+        ),
+        (
+            "sentinel-user",
+            config.security.sentinel_user.clone().unwrap_or_default(),
+        ),
+    ]
+}
+
+fn write_sentinel_help(out: &mut BytesMut) -> SenkoResult<()> {
+    const HELP: [&[u8]; 17] = [
+        b"CKQUORUM master-name",
+        b"CONFIG GET pattern",
+        b"CONFIG SET option value",
+        b"FAILOVER master-name",
+        b"FLUSHCONFIG",
+        b"GET-MASTER-ADDR-BY-NAME master-name",
+        b"HELP",
+        b"INFO-CACHE master-name [master-name ...]",
+        b"IS-MASTER-DOWN-BY-ADDR ip port current-epoch runid",
+        b"MASTER master-name",
+        b"MASTERS",
+        b"MONITOR name ip port quorum",
+        b"MYID",
+        b"PENDING-SCRIPTS",
+        b"REMOVE master-name",
+        b"REPLICAS master-name",
+        b"SET master-name option value",
+    ];
+    RespSerializer::write_array_header(out, HELP.len());
+    for entry in HELP {
+        RespSerializer::write_bulk_string(out, entry);
+    }
+    Ok(())
 }
 
 fn command_args(frame: Frame<'_>) -> SenkoResult<Vec<&[u8]>> {
@@ -155,12 +302,13 @@ fn ascii_upper(input: &[u8]) -> String {
 }
 
 fn write_command_table(out: &mut BytesMut) {
-    RespSerializer::write_array_header(out, 7);
+    RespSerializer::write_array_header(out, 8);
     RespSerializer::write_bulk_string(out, b"AUTH");
     RespSerializer::write_bulk_string(out, b"CLIENT");
     RespSerializer::write_bulk_string(out, b"HELLO");
     RespSerializer::write_bulk_string(out, b"PING");
     RespSerializer::write_bulk_string(out, b"INFO");
+    RespSerializer::write_bulk_string(out, b"RESET");
     RespSerializer::write_bulk_string(out, b"SENTINEL");
     RespSerializer::write_bulk_string(out, b"QUIT");
 }
@@ -275,6 +423,20 @@ fn client_command(
         return Ok(());
     }
     match ascii_upper(args[0]).as_str() {
+        "HELP" => {
+            const HELP: [&[u8]; 6] = [
+                b"HELP",
+                b"ID",
+                b"GETNAME",
+                b"SETNAME name",
+                b"INFO",
+                b"LIST",
+            ];
+            RespSerializer::write_array_header(out, HELP.len());
+            for item in HELP {
+                RespSerializer::write_bulk_string(out, item);
+            }
+        }
         "ID" => RespSerializer::write_integer(out, client.id as i64),
         "GETNAME" => {
             if client.name.is_empty() {
@@ -792,6 +954,11 @@ fn remove_master(out: &mut BytesMut, runtime: &SharedRuntime, name: &[u8]) -> Se
     let key = std::str::from_utf8(name)?.to_owned();
     let runtime_ref = &mut *runtime.borrow_mut();
     let original = runtime_ref.config.clone();
+    let removed_addr = runtime_ref
+        .snapshot()
+        .masters
+        .get(&key)
+        .map(|master| master.addr);
     runtime_ref
         .config
         .masters
@@ -803,6 +970,9 @@ fn remove_master(out: &mut BytesMut, runtime: &SharedRuntime, name: &[u8]) -> Se
     let _ = update_world(&runtime_ref.world, |snapshot| {
         snapshot.masters.remove(&key);
     });
+    if let Some(addr) = removed_addr {
+        runtime_ref.monitor.unregister_master(&key, addr);
+    }
     let snapshot = runtime_ref.snapshot();
     flush_config_atomic(&runtime_ref.config, &snapshot).map_err(config_error)?;
     RespSerializer::write_simple_string(out, b"OK");
@@ -1012,6 +1182,14 @@ fn glob_matches(pattern: &str, value: &str) -> bool {
     pattern == value
 }
 
+fn yes_no(value: bool) -> String {
+    if value {
+        "yes".to_owned()
+    } else {
+        "no".to_owned()
+    }
+}
+
 fn config_error(error: crate::config::ConfigError) -> SenkoError {
     match error {
         crate::config::ConfigError::Io(error) => SenkoError::Io(error),
@@ -1051,5 +1229,164 @@ pub fn drive_failovers(runtime: &SharedRuntime) {
         for event in events {
             runtime_ref.notifier.emit(event, name.as_str());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SentinelClient, dispatch};
+    use crate::{
+        SentinelRuntime,
+        config::{MasterConfig, SentinelConfig},
+    };
+    use senko_proto::{Aggregate, AggregateEncoding, AggregateKind, Frame};
+    use std::{
+        cell::RefCell,
+        fs,
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+        path::PathBuf,
+        rc::Rc,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn command_frame(args: &[&str]) -> Frame<'static> {
+        let payload = Box::leak(args.join(" ").into_boxed_str());
+        Frame::Array(Aggregate::new(
+            AggregateKind::Array,
+            args.len(),
+            payload.as_bytes(),
+            AggregateEncoding::Inline,
+        ))
+    }
+
+    fn temp_dir() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("senko-sentinel-cmd-{unique}"));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn runtime() -> Rc<RefCell<SentinelRuntime>> {
+        let dir = temp_dir();
+        let mut config = SentinelConfig::default();
+        config.general.dir = dir.clone();
+        config.general.id_file = Some(dir.join("sentinel-id"));
+        config.config_file = Some(dir.join("sentinel.toml"));
+        config.masters.push(MasterConfig {
+            name: "mymaster".to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port: 6379,
+            quorum: 2,
+            ..MasterConfig::default()
+        });
+        Rc::new(RefCell::new(SentinelRuntime::new(config).unwrap()))
+    }
+
+    fn client() -> SentinelClient {
+        SentinelClient::new(
+            1,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000),
+            true,
+        )
+    }
+
+    #[test]
+    fn sentinel_config_get_returns_supported_entries() {
+        let runtime = runtime();
+        let mut client = client();
+        let result = dispatch(
+            command_frame(&["SENTINEL", "CONFIG", "GET", "sentinel-*"]),
+            &runtime,
+            &mut client,
+        )
+        .unwrap();
+        let rendered = String::from_utf8_lossy(&result.response);
+        assert!(rendered.contains("sentinel-hz"));
+        assert!(rendered.contains("sentinel-user"));
+        assert!(rendered.contains("sentinel-pass"));
+    }
+
+    #[test]
+    fn sentinel_config_set_updates_runtime_config() {
+        let runtime = runtime();
+        let mut client = client();
+        let result = dispatch(
+            command_frame(&["SENTINEL", "CONFIG", "SET", "announce-port", "26380"]),
+            &runtime,
+            &mut client,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(result.response.to_vec()).unwrap(),
+            "+OK\r\n"
+        );
+        assert_eq!(runtime.borrow().config.network.announce_port, Some(26_380));
+    }
+
+    #[test]
+    fn sentinel_config_set_updates_live_monitor_hz() {
+        let runtime = runtime();
+        let mut client = client();
+        let result = dispatch(
+            command_frame(&["SENTINEL", "CONFIG", "SET", "sentinel-hz", "250"]),
+            &runtime,
+            &mut client,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(result.response.to_vec()).unwrap(),
+            "+OK\r\n"
+        );
+        assert_eq!(runtime.borrow().monitor.sentinel_hz_ms, 250);
+    }
+
+    #[test]
+    fn sentinel_remove_unregisters_master_from_monitor() {
+        let runtime = runtime();
+        let mut client = client();
+        dispatch(
+            command_frame(&["SENTINEL", "MONITOR", "backup", "127.0.0.1", "6380", "2"]),
+            &runtime,
+            &mut client,
+        )
+        .unwrap();
+        let addr = runtime.borrow().snapshot().masters["mymaster"].addr;
+        let result = dispatch(
+            command_frame(&["SENTINEL", "REMOVE", "mymaster"]),
+            &runtime,
+            &mut client,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(result.response.to_vec()).unwrap(),
+            "+OK\r\n"
+        );
+        assert!(!runtime.borrow().monitor.links.contains_key(&addr));
+        assert!(!runtime.borrow().monitor.info_cache.contains_key("mymaster"));
+    }
+
+    #[test]
+    fn sentinel_help_lists_config_commands() {
+        let runtime = runtime();
+        let mut client = client();
+        let result = dispatch(command_frame(&["SENTINEL", "HELP"]), &runtime, &mut client).unwrap();
+        let rendered = String::from_utf8_lossy(&result.response);
+        assert!(rendered.contains("CONFIG GET pattern"));
+        assert!(rendered.contains("CONFIG SET option value"));
+        assert!(rendered.contains("REPLICAS master-name"));
+    }
+
+    #[test]
+    fn sentinel_client_help_lists_supported_subcommands() {
+        let runtime = runtime();
+        let mut client = client();
+        let result = dispatch(command_frame(&["CLIENT", "HELP"]), &runtime, &mut client).unwrap();
+        let rendered = String::from_utf8_lossy(&result.response);
+        assert!(rendered.contains("GETNAME"));
+        assert!(rendered.contains("SETNAME name"));
+        assert!(rendered.contains("LIST"));
     }
 }

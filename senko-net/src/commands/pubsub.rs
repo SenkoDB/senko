@@ -817,6 +817,7 @@ mod tests {
             replica_psync2: false,
             replica_eof: false,
             replica_ack_offset: 0,
+            last_write_replication_offset: 0,
         }
     }
 

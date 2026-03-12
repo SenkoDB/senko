@@ -18,7 +18,7 @@ pub mod zset;
 
 pub use config::{
     AppendFsync, ByteSize, ConfigError, ReplicaOf, SenkoConfig, config_get, config_set,
-    human_duration, load_config, parse_duration_seconds, parse_replica_of,
+    config_set_startup, human_duration, load_config, parse_duration_seconds, parse_replica_of,
     render_default_config_toml, validate_config,
 };
 pub use error::{SenkoError, SenkoResult};

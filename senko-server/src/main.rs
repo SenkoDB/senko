@@ -4,7 +4,6 @@ mod logging;
 
 use std::{collections::HashSet, env, sync::Arc, thread};
 
-use clap::Parser;
 use cli::{Cli, Commands, check_config, load_effective_config};
 use compio::driver::{DriverType, ProactorBuilder};
 use compio::runtime::RuntimeBuilder;

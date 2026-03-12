@@ -162,6 +162,7 @@ pub struct ConnectionMeta {
     pub replica_psync2: bool,
     pub replica_eof: bool,
     pub replica_ack_offset: u64,
+    pub last_write_replication_offset: u64,
 }
 
 pub struct Connection {
@@ -261,6 +262,7 @@ impl Connection {
             replica_psync2: false,
             replica_eof: false,
             replica_ack_offset: 0,
+            last_write_replication_offset: 0,
         };
         let shared_meta = Arc::new(Mutex::new(meta.clone()));
         let shared_writer = Arc::new(Mutex::new(stream.clone()));
@@ -459,6 +461,9 @@ impl Connection {
         }
         self.meta.flags.remove(ConnectionFlags::MONITOR);
         self.blocked.borrow_mut().remove_client(self.meta.id);
+        if self.meta.flags.contains(ConnectionFlags::REPLICA) {
+            server_replication::on_disconnect(self.shard_id, self.meta.id);
+        }
         self.watch_registry.borrow_mut().cleanup_conn(self.meta.id);
         self.connections.borrow_mut().remove(&self.meta.id);
         self.client_connections.borrow_mut().remove(&self.meta.id);
@@ -579,6 +584,7 @@ impl ConnectionMeta {
             replica_psync2: false,
             replica_eof: false,
             replica_ack_offset: 0,
+            last_write_replication_offset: 0,
         }
     }
 }
@@ -1002,6 +1008,7 @@ async fn execute_immediate_command(
 
     if let Some(result) = dispatch_scripting_command(
         meta,
+        shard_id,
         command,
         args,
         store,
@@ -1045,6 +1052,9 @@ async fn execute_immediate_command(
     {
         return result
             .map(|outcome| {
+                if should_replicate_command(command) {
+                    server_replication::record_write(shard_id, meta, command, args);
+                }
                 (
                     outcome.response,
                     outcome.close_after_write,
@@ -1055,9 +1065,14 @@ async fn execute_immediate_command(
             .map_err(ConnectionControl::Continue);
     }
 
-    if let Some(result) =
-        server_replication::execute(command, args, meta.resp_version == 3, meta, config)
-    {
+    if let Some(result) = server_replication::execute(
+        command,
+        args,
+        meta.resp_version == 3,
+        shard_id,
+        meta,
+        config,
+    ) {
         return result
             .map(|outcome| {
                 (
@@ -1161,6 +1176,19 @@ async fn execute_immediate_command(
     )
     .await?
     {
+        apply_store_write_side_effects(
+            shard_id,
+            meta,
+            command,
+            args,
+            &blocked_response,
+            store,
+            blocked,
+            watch_registry,
+            connections,
+            client_connections,
+            tracking_registry,
+        );
         return Ok((
             serialize_response(&blocked_response, meta.resp_version == 3),
             false,
@@ -1178,19 +1206,43 @@ async fn execute_immediate_command(
         connections,
         meta,
     )? {
+        if should_replicate_command(command) {
+            server_replication::record_write(shard_id, meta, command, args);
+        }
         return Ok((response, false, false, false));
     }
 
-    if let Some(module_response) = crate::modules::dispatch(
-        shard_id,
-        command,
-        args,
-        meta.resp_version == 3,
-        shard_extensions,
-        &mut store.borrow_mut(),
-    ) {
+    let module_response = {
+        let mut store_ref = store.borrow_mut();
+        crate::modules::dispatch(
+            shard_id,
+            command,
+            args,
+            meta.resp_version == 3,
+            shard_extensions,
+            &mut store_ref,
+        )
+    };
+    if let Some(module_response) = module_response {
         return match module_response {
-            Ok(response) => Ok((response, false, false, false)),
+            Ok(response) => {
+                if response.is_write {
+                    notify_keys_written(
+                        &response.touched_keys,
+                        &mut store.borrow_mut(),
+                        watch_registry,
+                        connections,
+                    );
+                    client_ops::invalidate_written_keys(
+                        &response.touched_keys,
+                        meta.id,
+                        tracking_registry,
+                        client_connections,
+                    );
+                    server_replication::record_write(shard_id, meta, command, args);
+                }
+                Ok((response.response, false, false, false))
+            }
             Err(error) => Err(ConnectionControl::Continue(error)),
         };
     }
@@ -1206,27 +1258,18 @@ async fn execute_immediate_command(
     match response {
         Ok(response) => {
             client_ops::maybe_track_read(command, args, meta, tracking_registry);
-            {
-                let mut store_ref = store.borrow_mut();
-                let restore_no_touch = store_ref.no_touch();
-                store_ref.set_no_touch(meta.no_touch);
-                post_dispatch_notify(
-                    command,
-                    args,
-                    &response,
-                    &mut store_ref,
-                    blocked,
-                    watch_registry,
-                    connections,
-                );
-                store_ref.set_no_touch(restore_no_touch);
-            }
-            let keys = notification_keys(command, args, &response);
-            client_ops::invalidate_written_keys(
-                &keys,
-                meta.id,
-                tracking_registry,
+            apply_store_write_side_effects(
+                shard_id,
+                meta,
+                command,
+                args,
+                &response,
+                store,
+                blocked,
+                watch_registry,
+                connections,
                 client_connections,
+                tracking_registry,
             );
             Ok((
                 serialize_response(&response, meta.resp_version == 3),
@@ -1239,8 +1282,19 @@ async fn execute_immediate_command(
     }
 }
 
+#[inline]
+fn should_replicate_command(command: &[u8]) -> bool {
+    command_info::is_write_command(command)
+}
+
+#[inline]
+fn should_replicate_store_command(command: &[u8]) -> bool {
+    command_info::is_write_command(command)
+}
+
 struct ScriptRuntimeAdapter<'a> {
-    meta: &'a ConnectionMeta,
+    shard_id: usize,
+    meta: &'a mut ConnectionMeta,
     store: &'a Rc<RefCell<Store>>,
     blocked: &'a Rc<RefCell<BlockedKeyRegistry>>,
     watch_registry: &'a Rc<RefCell<WatchRegistry>>,
@@ -1283,6 +1337,9 @@ impl ScriptExecutionHooks for ScriptRuntimeAdapter<'_> {
             self.tracking_registry,
             self.client_connections,
         );
+        if should_replicate_store_command(command) {
+            server_replication::record_write(self.shard_id, self.meta, command, &frames);
+        }
         Ok(response_to_script_value(&response))
     }
 
@@ -1309,7 +1366,8 @@ impl ScriptExecutionHooks for ScriptRuntimeAdapter<'_> {
 
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_scripting_command(
-    meta: &ConnectionMeta,
+    meta: &mut ConnectionMeta,
+    shard_id: usize,
     command: &[u8],
     args: &[Frame<'_>],
     store: &Rc<RefCell<Store>>,
@@ -1338,7 +1396,10 @@ async fn dispatch_scripting_command(
                 {
                     return Some(Err(error));
                 }
+                let db_id = meta.db;
+                let username = meta.username.clone();
                 let mut runtime = ScriptRuntimeAdapter {
+                    shard_id,
                     meta,
                     store,
                     blocked,
@@ -1351,8 +1412,8 @@ async fn dispatch_scripting_command(
                     keys: &keys,
                     args: &argv,
                     readonly,
-                    db_id: meta.db,
-                    username: meta.username.as_str(),
+                    db_id,
+                    username: username.as_str(),
                     hooks: &mut runtime,
                 };
                 if eq_ascii(command, b"EVAL") || eq_ascii(command, b"EVAL_RO") {
@@ -2473,6 +2534,42 @@ fn post_dispatch_notify(
     while registry.notify(&key, store).is_some() {}
 }
 
+#[allow(clippy::too_many_arguments)]
+fn apply_store_write_side_effects(
+    shard_id: usize,
+    meta: &mut ConnectionMeta,
+    command: &[u8],
+    args: &[Frame<'_>],
+    response: &Response,
+    store: &Rc<RefCell<Store>>,
+    blocked: &Rc<RefCell<BlockedKeyRegistry>>,
+    watch_registry: &Rc<RefCell<WatchRegistry>>,
+    connections: &Rc<RefCell<ConnectionMap>>,
+    client_connections: &Rc<RefCell<ClientConnectionMap>>,
+    tracking_registry: &Rc<RefCell<TrackingRegistry>>,
+) {
+    {
+        let mut store_ref = store.borrow_mut();
+        let restore_no_touch = store_ref.no_touch();
+        store_ref.set_no_touch(meta.no_touch);
+        post_dispatch_notify(
+            command,
+            args,
+            response,
+            &mut store_ref,
+            blocked,
+            watch_registry,
+            connections,
+        );
+        store_ref.set_no_touch(restore_no_touch);
+    }
+    let keys = notification_keys(command, args, response);
+    client_ops::invalidate_written_keys(&keys, meta.id, tracking_registry, client_connections);
+    if should_replicate_store_command(command) {
+        server_replication::record_write(shard_id, meta, command, args);
+    }
+}
+
 fn notify_keys_written(
     keys: &[CompactString],
     store: &mut Store,
@@ -2502,6 +2599,14 @@ fn notification_keys(
         && matches!(response, Response::Value(None) | Response::Integer(0))
     {
         return Vec::new();
+    }
+    if eq_ascii(command, b"BLPOP")
+        || eq_ascii(command, b"BRPOP")
+        || eq_ascii(command, b"BLMPOP")
+        || eq_ascii(command, b"BZPOPMIN")
+        || eq_ascii(command, b"BZPOPMAX")
+    {
+        return blocking_response_keys(response);
     }
     let key_indexes: &[usize] = if eq_ascii(command, b"LMOVE")
         || eq_ascii(command, b"RPOPLPUSH")
@@ -2600,4 +2705,60 @@ fn notification_keys(
         .filter_map(|frame| frame_bytes(frame).ok())
         .filter_map(|bytes| CompactString::from_utf8(bytes).ok())
         .collect()
+}
+
+fn blocking_response_keys(response: &Response) -> Vec<CompactString> {
+    match response {
+        Response::Array(items) => items
+            .first()
+            .and_then(response_bulk_bytes)
+            .and_then(|bytes| CompactString::from_utf8(bytes).ok())
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn response_bulk_bytes(response: &Response) -> Option<&[u8]> {
+    match response {
+        Response::Value(Some(SenkoValue::Raw(bytes))) => Some(bytes.as_ref()),
+        Response::Simple(bytes) => Some(bytes),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use smallvec::smallvec;
+
+    use super::{blocking_response_keys, notification_keys};
+    use senko_core::SenkoValue;
+    use senko_store::Response;
+
+    #[test]
+    fn blocking_response_keys_extracts_actual_list_key() {
+        let response = Response::Array(Box::new(smallvec![
+            Response::Value(Some(SenkoValue::Raw(Bytes::from_static(b"jobs")))),
+            Response::Value(Some(SenkoValue::Raw(Bytes::from_static(b"item-1")))),
+        ]));
+
+        let keys = blocking_response_keys(&response);
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].as_str(), "jobs");
+    }
+
+    #[test]
+    fn notification_keys_uses_blocking_response_key_for_blpop() {
+        let response = Response::Array(Box::new(smallvec![
+            Response::Value(Some(SenkoValue::Raw(Bytes::from_static(b"queue:2")))),
+            Response::Value(Some(SenkoValue::Raw(Bytes::from_static(b"payload")))),
+        ]));
+
+        let keys = notification_keys(b"BLPOP", &[], &response);
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].as_str(), "queue:2");
+    }
 }

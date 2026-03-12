@@ -102,6 +102,15 @@ impl MonitorEngine {
         self.info_cache.entry(name.to_owned()).or_default();
     }
 
+    pub fn unregister_master(&mut self, name: &str, addr: SocketAddr) {
+        self.links.remove(&addr);
+        self.info_cache.remove(name);
+    }
+
+    pub fn set_sentinel_hz_ms(&mut self, sentinel_hz_ms: u64) {
+        self.sentinel_hz_ms = sentinel_hz_ms;
+    }
+
     pub fn queue_command(&mut self, addr: SocketAddr, command: SentinelCommand) {
         self.links
             .entry(addr)
@@ -294,5 +303,15 @@ slave0:ip=127.0.0.1,port=6380,state=online,offset=99,lag=0
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6380)
         );
         assert_eq!(info.replicas[0].offset, 99);
+    }
+
+    #[test]
+    fn unregister_master_removes_link_and_cache() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6379);
+        let mut engine = MonitorEngine::new(1_000);
+        engine.register_master("mymaster", addr);
+        engine.unregister_master("mymaster", addr);
+        assert!(!engine.links.contains_key(&addr));
+        assert!(!engine.info_cache.contains_key("mymaster"));
     }
 }

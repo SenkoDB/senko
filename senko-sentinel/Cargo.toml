@@ -11,6 +11,7 @@ arc-swap.workspace = true
 bitflags.workspace = true
 blake3 = "=1.8.2"
 bytes.workspace = true
+clap = { version = "4", features = ["derive", "env"] }
 compio.workspace = true
 compact_str.workspace = true
 futures-util.workspace = true

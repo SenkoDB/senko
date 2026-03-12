@@ -536,6 +536,7 @@ mod tests {
             replica_psync2: false,
             replica_eof: false,
             replica_ack_offset: 0,
+            last_write_replication_offset: 0,
         }
     }
 
@@ -566,6 +567,7 @@ mod tests {
     #[test]
     fn reset_clears_connection_state() {
         let config = SenkoConfig::default();
+        crate::acl::init(&config).expect("acl init");
         let blocked = Rc::new(RefCell::new(BlockedKeyRegistry::default()));
         let watch_registry = Rc::new(RefCell::new(WatchRegistry::default()));
         let watch_state = Rc::new(RefCell::new(WatchState::default()));

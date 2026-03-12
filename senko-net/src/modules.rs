@@ -31,7 +31,7 @@ pub fn dispatch(
     resp3: bool,
     extensions: &Arc<ShardExtensions>,
     store: &mut Store,
-) -> Option<Result<Vec<u8>, Vec<u8>>> {
+) -> Option<Result<ModuleDispatchResult, Vec<u8>>> {
     let raw_args = match args.iter().map(frame_bytes).collect::<Result<Vec<_>, _>>() {
         Ok(raw_args) => raw_args,
         Err(error) => return Some(Err(error_bytes(&error))),
@@ -40,12 +40,24 @@ pub fn dispatch(
         shard_id,
         extensions: Arc::clone(extensions),
         store,
+        dirty: false,
+        touched_keys: smallvec::SmallVec::new(),
     };
     match registry().execute(command, &mut ctx, &raw_args) {
-        Some(Ok(response)) => Some(Ok(serialize(&response, resp3))),
+        Some(Ok(response)) => Some(Ok(ModuleDispatchResult {
+            response: serialize(&response, resp3),
+            is_write: ctx.dirty,
+            touched_keys: ctx.touched_keys,
+        })),
         Some(Err(error)) => Some(Err(error_message(error.message()))),
         None => None,
     }
+}
+
+pub struct ModuleDispatchResult {
+    pub response: Vec<u8>,
+    pub is_write: bool,
+    pub touched_keys: smallvec::SmallVec<[compact_str::CompactString; 4]>,
 }
 
 pub fn serialize(response: &ModuleResponse, resp3: bool) -> Vec<u8> {
@@ -126,6 +138,8 @@ struct NetModuleCommandContext {
     shard_id: usize,
     extensions: Arc<ShardExtensions>,
     store: *mut Store,
+    dirty: bool,
+    touched_keys: smallvec::SmallVec<[compact_str::CompactString; 4]>,
 }
 
 impl ModuleCommandContext for NetModuleCommandContext {
@@ -164,13 +178,52 @@ impl ModuleCommandContext for NetModuleCommandContext {
 
     fn set_value(&mut self, key: &[u8], value: SenkoValue) {
         if let Ok(key) = compact_str::CompactString::from_utf8(key) {
+            self.dirty = true;
+            if !self.touched_keys.contains(&key) {
+                self.touched_keys.push(key.clone());
+            }
             // SAFETY: same exclusive access guarantee as above.
             let _ = unsafe { (&mut *self.store).set(key, value, SetOptions::default()) };
         }
     }
 
     fn delete_key(&mut self, key: &[u8]) -> u64 {
+        if let Ok(key) = compact_str::CompactString::from_utf8(key)
+            && !self.touched_keys.contains(&key)
+        {
+            self.touched_keys.push(key);
+        }
+        self.dirty = true;
         // SAFETY: same exclusive access guarantee as above.
         unsafe { (&mut *self.store).delete(key) as u64 }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use bytes::Bytes;
+
+    #[test]
+    fn module_context_marks_store_mutations_as_writes() {
+        let extensions = Arc::new(ShardExtensions::default());
+        let mut store = Store::new(None);
+        let mut ctx = NetModuleCommandContext {
+            shard_id: 0,
+            extensions,
+            store: &mut store,
+            dirty: false,
+            touched_keys: smallvec::SmallVec::new(),
+        };
+
+        ctx.set_value(b"alpha", SenkoValue::Raw(Bytes::from_static(b"1")));
+        let deleted = ctx.delete_key(b"alpha");
+
+        assert_eq!(deleted, 1);
+        assert!(ctx.dirty);
+        assert_eq!(ctx.touched_keys.len(), 1);
+        assert_eq!(ctx.touched_keys[0].as_str(), "alpha");
     }
 }

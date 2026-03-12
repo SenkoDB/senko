@@ -1341,6 +1341,20 @@ enum FieldKind {
     LogLevel,
     MaxMemoryPolicy,
     AppendFsync,
+    TlsAuthClients,
+    TlsAuthField,
+    OomScoreAdj,
+    I32Triplet,
+    AclPubSubDefault,
+    ProtectedConfigAccess,
+    SanitizePayload,
+    DisklessLoad,
+    PropagationErrorBehavior,
+    EndpointType,
+    SlotStatsEnabled,
+    MaxMemoryClients,
+    ClientOutputBufferLimitList,
+    ShutdownAction,
 }
 
 fn field_kind(path: &str) -> Option<FieldKind> {
@@ -1362,6 +1376,15 @@ fn field_kind(path: &str) -> Option<FieldKind> {
             FieldKind::Path
         }
         "tls.key_file_pass" => FieldKind::String,
+        "tls.auth_clients" => FieldKind::TlsAuthClients,
+        "tls.auth_clients_user" => FieldKind::TlsAuthField,
+        "tls.replication" | "tls.cluster" | "tls.prefer_server_ciphers" | "tls.session_caching" => {
+            FieldKind::Bool
+        }
+        "tls.protocols" => FieldKind::StringList,
+        "tls.ciphers" | "tls.ciphersuites" => FieldKind::String,
+        "tls.session_cache_size" => FieldKind::Usize,
+        "tls.session_cache_timeout" => FieldKind::U64,
         "general.daemonize" => FieldKind::Bool,
         "general.pidfile" | "general.logfile" => FieldKind::Path,
         "general.loglevel" => FieldKind::LogLevel,
@@ -1376,11 +1399,18 @@ fn field_kind(path: &str) -> Option<FieldKind> {
         }
         "general.databases" => FieldKind::U8,
         "general.hz" => FieldKind::U32,
+        "general.oom_score_adj" => FieldKind::OomScoreAdj,
+        "general.oom_score_adj_values" => FieldKind::I32Triplet,
         "general.include" | "general.ignore_warnings" | "plugins.enabled" => FieldKind::StringList,
         "security.requirepass" => FieldKind::String,
         "security.aclfile" => FieldKind::Path,
         "security.acllog_max_len" | "security.tracking_table_max_keys" => FieldKind::Usize,
         "security.users" => FieldKind::StringList,
+        "security.acl_pubsub_default" => FieldKind::AclPubSubDefault,
+        "security.enable_protected_configs"
+        | "security.enable_debug_command"
+        | "security.enable_module_command" => FieldKind::ProtectedConfigAccess,
+        "security.client_output_buffer_limit" => FieldKind::ClientOutputBufferLimitList,
         "security.client_query_buffer_limit" | "security.proto_max_bulk_len" => FieldKind::ByteSize,
         "persistence.save" => FieldKind::SaveList,
         "persistence.stop_writes_on_bgsave_error"
@@ -1389,6 +1419,7 @@ fn field_kind(path: &str) -> Option<FieldKind> {
         | "persistence.rdb_del_sync_files" => FieldKind::Bool,
         "persistence.dbfilename" => FieldKind::String,
         "persistence.dir" => FieldKind::Path,
+        "persistence.sanitize_dump_payload" => FieldKind::SanitizePayload,
         "replication.replicaof" => FieldKind::ReplicaOf,
         "replication.masterauth" | "replication.masteruser" | "replication.replica_announce_ip" => {
             FieldKind::String
@@ -1398,6 +1429,7 @@ fn field_kind(path: &str) -> Option<FieldKind> {
         | "replication.repl_diskless_sync"
         | "replication.repl_disable_tcp_nodelay"
         | "replication.replica_ignore_maxmemory" => FieldKind::Bool,
+        "replication.repl_diskless_load" => FieldKind::DisklessLoad,
         "replication.repl_diskless_sync_delay"
         | "replication.repl_ping_replica_period"
         | "replication.repl_timeout"
@@ -1411,6 +1443,7 @@ fn field_kind(path: &str) -> Option<FieldKind> {
             FieldKind::ByteSize
         }
         "replication.replica_announce_port" => FieldKind::U16,
+        "replication.propagation_error_behavior" => FieldKind::PropagationErrorBehavior,
         "cluster.enabled"
         | "cluster.allow_replica_migration"
         | "cluster.require_full_coverage"
@@ -1431,8 +1464,11 @@ fn field_kind(path: &str) -> Option<FieldKind> {
             FieldKind::String
         }
         "cluster.compatibility_sample_ratio" => FieldKind::U8,
+        "cluster.preferred_endpoint_type" => FieldKind::EndpointType,
+        "cluster.slot_stats_enabled" => FieldKind::SlotStatsEnabled,
         "memory.maxmemory" => FieldKind::ByteSize,
         "memory.maxmemory_policy" => FieldKind::MaxMemoryPolicy,
+        "memory.maxmemory_clients" => FieldKind::MaxMemoryClients,
         "memory.maxmemory_samples"
         | "memory.maxmemory_eviction_tenacity"
         | "memory.active_defrag_threshold_lower"
@@ -1490,6 +1526,7 @@ fn field_kind(path: &str) -> Option<FieldKind> {
         "aof.auto_aof_rewrite_min_size" | "aof.aof_load_corrupt_tail_max_size" => {
             FieldKind::ByteSize
         }
+        "aof.shutdown_on_sigint" | "aof.shutdown_on_sigterm" => FieldKind::ShutdownAction,
         _ => return None,
     })
 }
@@ -1645,13 +1682,30 @@ pub fn config_get(config: &SenkoConfig, pattern: &str) -> Vec<(String, String)> 
 }
 
 pub fn config_set(config: &mut SenkoConfig, key: &str, value: &str) -> Result<(), ConfigError> {
+    config_set_internal(config, key, value, false)
+}
+
+pub fn config_set_startup(
+    config: &mut SenkoConfig,
+    key: &str,
+    value: &str,
+) -> Result<(), ConfigError> {
+    config_set_internal(config, key, value, true)
+}
+
+fn config_set_internal(
+    config: &mut SenkoConfig,
+    key: &str,
+    value: &str,
+    allow_immutable: bool,
+) -> Result<(), ConfigError> {
     let canonical = resolve_config_key(key);
     if canonical == key && field_kind(canonical).is_none() {
         return Err(ConfigError::ValidationError(format!(
             "unknown config key '{key}'"
         )));
     }
-    if is_immutable_config_key(canonical) {
+    if !allow_immutable && is_immutable_config_key(canonical) {
         return Err(ConfigError::ValidationError(format!(
             "config key '{key}' is immutable and requires restart"
         )));
@@ -1996,7 +2050,32 @@ fn parse_config_value(kind: FieldKind, raw: &str) -> Result<Value, ConfigError> 
         FieldKind::LogLevel => Value::String(parse_log_level(raw)?),
         FieldKind::MaxMemoryPolicy => Value::String(parse_maxmemory_policy(raw)?),
         FieldKind::AppendFsync => Value::String(parse_appendfsync(raw)?),
+        FieldKind::TlsAuthClients => Value::String(parse_tls_auth_clients(raw)?),
+        FieldKind::TlsAuthField => Value::String(parse_tls_auth_field(raw)?),
+        FieldKind::OomScoreAdj => Value::String(parse_oom_score_adj(raw)?),
+        FieldKind::I32Triplet => Value::Array(parse_i32_triplet(raw)?),
+        FieldKind::AclPubSubDefault => Value::String(parse_acl_pubsub_default(raw)?),
+        FieldKind::ProtectedConfigAccess => Value::String(parse_protected_config_access(raw)?),
+        FieldKind::SanitizePayload => Value::String(parse_sanitize_payload(raw)?),
+        FieldKind::DisklessLoad => Value::String(parse_diskless_load(raw)?),
+        FieldKind::PropagationErrorBehavior => {
+            Value::String(parse_propagation_error_behavior(raw)?)
+        }
+        FieldKind::EndpointType => Value::String(parse_endpoint_type(raw)?),
+        FieldKind::SlotStatsEnabled => Value::String(parse_slot_stats_enabled(raw)?),
+        FieldKind::MaxMemoryClients => parse_maxmemory_clients(raw)?,
+        FieldKind::ClientOutputBufferLimitList => {
+            Value::Array(parse_client_output_buffer_limits(raw)?)
+        }
+        FieldKind::ShutdownAction => Value::String(parse_shutdown_action(raw)?),
     })
+}
+
+fn split_list_tokens(value: &str) -> Vec<&str> {
+    value
+        .split(|ch: char| ch == ',' || ch.is_ascii_whitespace())
+        .filter(|item| !item.trim().is_empty())
+        .collect()
 }
 
 fn parse_bool(value: &str) -> Result<bool, ConfigError> {
@@ -2065,6 +2144,198 @@ fn parse_log_level(value: &str) -> Result<String, ConfigError> {
         }
         _ => Err(ConfigError::ValidationError(format!(
             "invalid log level '{value}'"
+        ))),
+    }
+}
+
+fn parse_tls_auth_clients(value: &str) -> Result<String, ConfigError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "yes" | "no" | "optional" => Ok(value.trim().to_ascii_lowercase()),
+        _ => Err(ConfigError::ValidationError(format!(
+            "invalid tls auth-clients value '{value}'"
+        ))),
+    }
+}
+
+fn parse_tls_auth_field(value: &str) -> Result<String, ConfigError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "off" | "cn" => Ok(value.trim().to_ascii_lowercase()),
+        _ => Err(ConfigError::ValidationError(format!(
+            "invalid tls auth-clients-user value '{value}'"
+        ))),
+    }
+}
+
+fn parse_oom_score_adj(value: &str) -> Result<String, ConfigError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "no" | "yes" | "relative" => Ok(value.trim().to_ascii_lowercase()),
+        _ => Err(ConfigError::ValidationError(format!(
+            "invalid oom score adj value '{value}'"
+        ))),
+    }
+}
+
+fn parse_i32_triplet(value: &str) -> Result<Vec<Value>, ConfigError> {
+    let values = split_list_tokens(value);
+    if values.len() != 3 {
+        return Err(ConfigError::ValidationError(
+            "expected exactly three integer values".to_owned(),
+        ));
+    }
+    values
+        .into_iter()
+        .map(|item| parse_i32(item).map(|parsed| Value::Integer(i64::from(parsed))))
+        .collect()
+}
+
+fn parse_acl_pubsub_default(value: &str) -> Result<String, ConfigError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "allchannels" | "resetchannels" => Ok(value.trim().to_ascii_lowercase()),
+        _ => Err(ConfigError::ValidationError(format!(
+            "invalid acl pubsub default '{value}'"
+        ))),
+    }
+}
+
+fn parse_protected_config_access(value: &str) -> Result<String, ConfigError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "yes" | "no" | "local" => Ok(value.trim().to_ascii_lowercase()),
+        _ => Err(ConfigError::ValidationError(format!(
+            "invalid protected config access '{value}'"
+        ))),
+    }
+}
+
+fn parse_sanitize_payload(value: &str) -> Result<String, ConfigError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "no" | "clients" | "yes" => Ok(value.trim().to_ascii_lowercase()),
+        _ => Err(ConfigError::ValidationError(format!(
+            "invalid sanitize dump payload '{value}'"
+        ))),
+    }
+}
+
+fn parse_diskless_load(value: &str) -> Result<String, ConfigError> {
+    match value.trim().to_ascii_lowercase().replace('-', "").as_str() {
+        "disabled" => Ok("disabled".to_owned()),
+        "whendbempty" => Ok("whendbempty".to_owned()),
+        "swapdb" => Ok("swapdb".to_owned()),
+        _ => Err(ConfigError::ValidationError(format!(
+            "invalid repl diskless load '{value}'"
+        ))),
+    }
+}
+
+fn parse_propagation_error_behavior(value: &str) -> Result<String, ConfigError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "ignore" | "panic" => Ok(value.trim().to_ascii_lowercase()),
+        _ => Err(ConfigError::ValidationError(format!(
+            "invalid propagation error behavior '{value}'"
+        ))),
+    }
+}
+
+fn parse_endpoint_type(value: &str) -> Result<String, ConfigError> {
+    match value.trim().to_ascii_lowercase().replace('-', "").as_str() {
+        "ip" => Ok("ip".to_owned()),
+        "hostname" => Ok("hostname".to_owned()),
+        "unknownendpoint" => Ok("unknownendpoint".to_owned()),
+        _ => Err(ConfigError::ValidationError(format!(
+            "invalid preferred endpoint type '{value}'"
+        ))),
+    }
+}
+
+fn parse_slot_stats_enabled(value: &str) -> Result<String, ConfigError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "yes" | "no" => Ok(value.trim().to_ascii_lowercase()),
+        _ => Err(ConfigError::ValidationError(format!(
+            "invalid slot stats enabled value '{value}'"
+        ))),
+    }
+}
+
+fn parse_maxmemory_clients(value: &str) -> Result<Value, ConfigError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed == "0" {
+        return Ok(Value::Integer(0));
+    }
+    if let Some(percent) = trimmed.strip_suffix('%') {
+        let parsed = percent.trim().parse::<f64>().map_err(|_| {
+            ConfigError::ValidationError(format!("invalid maxmemory-clients value '{value}'"))
+        })?;
+        return Ok(Value::Float(parsed));
+    }
+    Ok(Value::Integer(
+        ByteSize::from_str(trimmed)
+            .map_err(ConfigError::ValidationError)?
+            .0 as i64,
+    ))
+}
+
+fn parse_client_output_buffer_limits(value: &str) -> Result<Vec<Value>, ConfigError> {
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    value
+        .split(';')
+        .filter(|entry| !entry.trim().is_empty())
+        .map(|entry| {
+            let tokens = entry.split_whitespace().collect::<Vec<_>>();
+            if tokens.len() != 4 {
+                return Err(ConfigError::ValidationError(
+                    "client-output-buffer-limit entries require class hard soft seconds".to_owned(),
+                ));
+            }
+            let class = match tokens[0].to_ascii_lowercase().replace('-', "").as_str() {
+                "normal" => "normal",
+                "replica" | "slave" => "replica",
+                "pubsub" => "pubsub",
+                _ => {
+                    return Err(ConfigError::ValidationError(format!(
+                        "invalid client class '{}'",
+                        tokens[0]
+                    )));
+                }
+            };
+            Ok(Value::Table(
+                [
+                    ("class".to_owned(), Value::String(class.to_owned())),
+                    (
+                        "hard_limit".to_owned(),
+                        Value::Integer(
+                            ByteSize::from_str(tokens[1])
+                                .map_err(ConfigError::ValidationError)?
+                                .0 as i64,
+                        ),
+                    ),
+                    (
+                        "soft_limit".to_owned(),
+                        Value::Integer(
+                            ByteSize::from_str(tokens[2])
+                                .map_err(ConfigError::ValidationError)?
+                                .0 as i64,
+                        ),
+                    ),
+                    (
+                        "soft_seconds".to_owned(),
+                        Value::Integer(parse_u64(tokens[3])? as i64),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ))
+        })
+        .collect()
+}
+
+fn parse_shutdown_action(value: &str) -> Result<String, ConfigError> {
+    match value.trim().to_ascii_lowercase().replace('-', "").as_str() {
+        "save" => Ok("save".to_owned()),
+        "nosave" => Ok("nosave".to_owned()),
+        "default" => Ok("default".to_owned()),
+        _ => Err(ConfigError::ValidationError(format!(
+            "invalid shutdown action '{value}'"
         ))),
     }
 }

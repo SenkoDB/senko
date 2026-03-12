@@ -987,4 +987,23 @@ mod tests {
         assert!(String::from_utf8_lossy(&err).contains("can't set immutable config"));
         assert_eq!(snapshot().hz, 20);
     }
+
+    #[test]
+    fn init_applies_hll_and_debug_runtime_settings() {
+        let _guard = config_test_guard();
+        let config = SenkoConfig {
+            encoding: senko_core::config::EncodingConfig {
+                hll_sparse_max_bytes: 4096,
+                ..SenkoConfig::default().encoding
+            },
+            security: senko_core::config::SecurityConfig {
+                enable_debug_command: ProtectedConfigAccess::Yes,
+                ..SenkoConfig::default().security
+            },
+            ..SenkoConfig::default()
+        };
+        init(&config);
+        assert_eq!(senko_store::hll::sparse_max_bytes(), 4096);
+        assert!(senko_store::hll::debug_commands_enabled());
+    }
 }

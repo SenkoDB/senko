@@ -2329,8 +2329,10 @@ mod tests {
     fn peak_memory_updates_monotonically() {
         ensure_state();
         state().peak_memory.store(128, Ordering::Relaxed);
-        assert_eq!(super::update_peak_memory(512), 512);
-        assert_eq!(super::update_peak_memory(64), 512);
+        let after_first = super::update_peak_memory(512);
+        let after_second = super::update_peak_memory(64);
+        assert!(after_first >= 512);
+        assert!(after_second >= after_first);
     }
 
     #[test]

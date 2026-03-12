@@ -18,7 +18,7 @@ use compio::io::AsyncWrite;
 use getrandom::fill as getrandom_fill;
 use hashbrown::HashMap;
 use roaring::RoaringBitmap;
-use senko_core::{SenkoConfig, SenkoValue};
+use senko_core::{SenkoConfig, SenkoError, SenkoValue};
 use senko_proto::Frame;
 use senko_store::{Response, pattern::glob_match};
 use sha2::{Digest, Sha256};
@@ -32,7 +32,6 @@ use crate::{
     },
 };
 
-const DEFAULT_LOG_MAX: usize = 128;
 const DEFAULT_USER: &str = "default";
 const CATEGORY_READ: u32 = 1 << 0;
 const CATEGORY_WRITE: u32 = 1 << 1;
@@ -141,7 +140,12 @@ impl AclUser {
         user.channel_patterns.push(CompactString::const_new("*"));
         user.allowed_commands
             .allow_many(command_registry().all_ids());
-        if let Some(password) = &config.auth_password {
+        if let Some(password) = config
+            .security
+            .requirepass
+            .as_ref()
+            .or(config.auth_password.as_ref())
+        {
             user.nopass = false;
             user.passwords.push(hash_password(password.as_bytes()));
         } else {
@@ -228,9 +232,13 @@ impl AclState {
         Self {
             users,
             log: VecDeque::new(),
-            log_max: DEFAULT_LOG_MAX,
+            log_max: config.security.acllog_max_len.max(1),
             next_entry_id: 1,
-            aclfile: config.aclfile.clone(),
+            aclfile: config
+                .security
+                .aclfile
+                .clone()
+                .or_else(|| config.aclfile.clone()),
         }
     }
 
@@ -340,10 +348,18 @@ enum SetUserOp {
     Reset,
 }
 
-pub fn init(config: &SenkoConfig) {
+pub fn init(config: &SenkoConfig) -> Result<(), SenkoError> {
     let _ = command_registry();
-    let state = Arc::new(AclState::new(config));
+    let state = Arc::new(
+        load_configured_acl_state(config)
+            .map_err(|message| SenkoError::ProtocolMessage(message.into()))?,
+    );
+    if let Some(cell) = ACL_REGISTRY.get() {
+        *cell.lock().expect("acl state lock poisoned") = state;
+        return Ok(());
+    }
     let _ = ACL_REGISTRY.set(Arc::new(Mutex::new(state)));
+    Ok(())
 }
 
 pub fn current_state() -> Arc<AclState> {
@@ -943,6 +959,56 @@ fn load_acl_file(path: &Path, config: &SenkoConfig) -> Result<AclState, Vec<u8>>
     }
     state.aclfile = Some(path.to_path_buf());
     Ok(state)
+}
+
+fn load_configured_acl_state(config: &SenkoConfig) -> Result<AclState, String> {
+    if let Some(path) = config
+        .security
+        .aclfile
+        .as_deref()
+        .or(config.aclfile.as_deref())
+    {
+        if !path.exists() {
+            return Ok(AclState::new(config));
+        }
+        return load_acl_file(path, config)
+            .map_err(|error| String::from_utf8_lossy(&error).into_owned());
+    }
+    let mut state = AclState::new(config);
+    apply_inline_acl_users(&mut state, &config.security.users)?;
+    Ok(state)
+}
+
+fn apply_inline_acl_users(state: &mut AclState, users: &[String]) -> Result<(), String> {
+    for entry in users {
+        let tokens = split_acl_line(entry);
+        if tokens.is_empty() {
+            continue;
+        }
+        let (username, rules) = if tokens[0] == "user" {
+            let Some(username) = tokens.get(1) else {
+                return Err("ERR Error in ACL user config: missing username".to_owned());
+            };
+            (username.as_str(), &tokens[2..])
+        } else {
+            (tokens[0].as_str(), &tokens[1..])
+        };
+        if rules.is_empty() {
+            return Err(format!(
+                "ERR Error in ACL user config for '{username}': missing rules"
+            ));
+        }
+        let ops = parse_setuser_rule_tokens(rules)?;
+        let mut user = state
+            .users
+            .remove(username)
+            .unwrap_or_else(|| AclUser::new(username));
+        for op in ops {
+            apply_setuser_op(&mut user, op);
+        }
+        state.users.insert(CompactString::from(username), user);
+    }
+    Ok(())
 }
 
 fn save_acl_file(path: &Path, state: &AclState) -> Result<(), String> {
@@ -2235,15 +2301,12 @@ mod tests {
             replica_psync2: false,
             replica_eof: false,
             replica_ack_offset: 0,
+            last_write_replication_offset: 0,
         }
     }
 
     fn init_test_acl_with(config: SenkoConfig) -> SenkoConfig {
-        if ACL_REGISTRY.get().is_none() {
-            init(&config);
-        } else {
-            swap_state(AclState::new(&config));
-        }
+        init(&config).expect("acl init");
         config
     }
 
@@ -2488,6 +2551,61 @@ mod tests {
         assert!(!after_error.users.contains_key("alice"));
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn startup_config_applies_acllog_max_len() {
+        let _guard = acl_test_guard();
+        let config = SenkoConfig {
+            security: senko_core::config::SecurityConfig {
+                acllog_max_len: 3,
+                ..SenkoConfig::default().security
+            },
+            ..SenkoConfig::default()
+        };
+        let _ = init_test_acl_with(config);
+        assert_eq!(current_state().log_max, 3);
+    }
+
+    #[test]
+    fn startup_config_loads_aclfile() {
+        let _guard = acl_test_guard();
+        let path = temp_acl_path("startup-load");
+        fs::write(&path, "user bob on nopass ~cache:* +get\n").unwrap();
+        let config = SenkoConfig {
+            aclfile: Some(path.clone()),
+            security: senko_core::config::SecurityConfig {
+                aclfile: Some(path.clone()),
+                ..SenkoConfig::default().security
+            },
+            ..SenkoConfig::default()
+        };
+        let _ = init_test_acl_with(config);
+        let state = current_state();
+        let bob = state.users.get("bob").expect("bob user");
+        assert!(bob.enabled);
+        assert!(
+            bob.allowed_commands
+                .check(command_registry().id_of("get").expect("get id"))
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn startup_config_applies_inline_users() {
+        let _guard = acl_test_guard();
+        let mut config = SenkoConfig::default();
+        config.security.users = vec!["user alice on nopass ~cache:* +get".to_owned()];
+        let _ = init_test_acl_with(config);
+        let state = current_state();
+        let alice = state.users.get("alice").expect("alice user");
+        assert!(alice.enabled);
+        assert_eq!(alice.key_patterns.len(), 1);
+        assert!(
+            alice
+                .allowed_commands
+                .check(command_registry().id_of("get").expect("get id"))
+        );
     }
 
     #[test]

@@ -421,6 +421,18 @@ fn dispatch_cluster(
     if eq_ascii(subcommand, b"MYSHARDID") {
         return cluster_myshardid(rest, cluster);
     }
+    if eq_ascii(subcommand, b"SLOTS") {
+        return cluster_slots_response(rest, resp3, cluster);
+    }
+    if eq_ascii(subcommand, b"KEYSLOT") {
+        return cluster_keyslot(rest);
+    }
+    if eq_ascii(subcommand, b"BUMPEPOCH") {
+        return cluster_bumpepoch(rest, cluster);
+    }
+    if eq_ascii(subcommand, b"COUNT-FAILURE-REPORTS") {
+        return cluster_count_failure_reports(rest, resp3, cluster);
+    }
     if eq_ascii(subcommand, b"MEET") {
         return cluster_meet(rest, cluster);
     }
@@ -429,6 +441,9 @@ fn dispatch_cluster(
     }
     if eq_ascii(subcommand, b"REPLICATE") {
         return cluster_replicate(rest, cluster);
+    }
+    if eq_ascii(subcommand, b"SET-CONFIG-EPOCH") {
+        return cluster_set_config_epoch(rest, cluster);
     }
     if eq_ascii(subcommand, b"FAILOVER") {
         return cluster_failover(rest, cluster);
@@ -466,8 +481,11 @@ fn dispatch_cluster(
     if eq_ascii(subcommand, b"FLUSHSLOTS") {
         return cluster_flushslots(rest, cluster, store);
     }
-    if eq_ascii(subcommand, b"REPLICAS") {
+    if eq_ascii(subcommand, b"REPLICAS") || eq_ascii(subcommand, b"SLAVES") {
         return cluster_replicas(rest, resp3, cluster);
+    }
+    if eq_ascii(subcommand, b"HELP") {
+        return cluster_help(rest, resp3);
     }
 
     Err(error_message(&format!(
@@ -562,6 +580,71 @@ fn cluster_myshardid(
     Ok(ok_outcome(bulk_string(shard_id.to_string().as_bytes())))
 }
 
+fn cluster_slots_response(
+    args: &[Frame<'_>],
+    resp3: bool,
+    cluster: &Rc<RefCell<ClusterCommandState>>,
+) -> Result<ClusterCommandOutcome, Vec<u8>> {
+    if !args.is_empty() {
+        return Err(error_message(
+            "ERR wrong number of arguments for 'cluster|slots' command",
+        ));
+    }
+    let state = cluster.borrow();
+    state.ensure_enabled()?;
+    Ok(ok_outcome(serialize_response(
+        &build_slots_response(&state),
+        resp3,
+    )))
+}
+
+fn cluster_keyslot(args: &[Frame<'_>]) -> Result<ClusterCommandOutcome, Vec<u8>> {
+    let [key] = args else {
+        return Err(error_message(
+            "ERR wrong number of arguments for 'cluster|keyslot' command",
+        ));
+    };
+    let key = frame_bytes(key).map_err(|error| error_bytes(&error))?;
+    Ok(ok_outcome(serialize_response(
+        &Response::Integer(i64::from(senko_cluster::crc16_slot(key))),
+        false,
+    )))
+}
+
+fn cluster_bumpepoch(
+    args: &[Frame<'_>],
+    cluster: &Rc<RefCell<ClusterCommandState>>,
+) -> Result<ClusterCommandOutcome, Vec<u8>> {
+    if !args.is_empty() {
+        return Err(error_message(
+            "ERR wrong number of arguments for 'cluster|bumpepoch' command",
+        ));
+    }
+    let mut state = cluster.borrow_mut();
+    state.ensure_enabled()?;
+    let _ = state.increment_epoch()?;
+    Ok(ok_outcome(simple_string(b"BUMPED")))
+}
+
+fn cluster_count_failure_reports(
+    args: &[Frame<'_>],
+    resp3: bool,
+    cluster: &Rc<RefCell<ClusterCommandState>>,
+) -> Result<ClusterCommandOutcome, Vec<u8>> {
+    let [node_id] = args else {
+        return Err(error_message(
+            "ERR wrong number of arguments for 'cluster|count-failure-reports' command",
+        ));
+    };
+    let node_id = parse_node_id(frame_bytes(node_id).map_err(|error| error_bytes(&error))?)?;
+    let state = cluster.borrow();
+    state.ensure_enabled()?;
+    if state.topology_ref()?.state().get_node(&node_id).is_none() {
+        return Err(error_message("ERR Unknown node"));
+    }
+    Ok(ok_outcome(serialize_response(&Response::Integer(0), resp3)))
+}
+
 fn cluster_meet(
     args: &[Frame<'_>],
     cluster: &Rc<RefCell<ClusterCommandState>>,
@@ -594,6 +677,39 @@ fn cluster_meet(
     state.meet_queue.push(MeetSeed { addr, cluster_addr });
     state.message_stats.messages_sent = state.message_stats.messages_sent.saturating_add(1);
     state.message_stats.meet_sent = state.message_stats.meet_sent.saturating_add(1);
+    Ok(ok_outcome(simple_string(b"OK")))
+}
+
+fn cluster_set_config_epoch(
+    args: &[Frame<'_>],
+    cluster: &Rc<RefCell<ClusterCommandState>>,
+) -> Result<ClusterCommandOutcome, Vec<u8>> {
+    let [epoch] = args else {
+        return Err(error_message(
+            "ERR wrong number of arguments for 'cluster|set-config-epoch' command",
+        ));
+    };
+    let epoch = parse_u64(frame_bytes(epoch).map_err(|error| error_bytes(&error))?)
+        .map_err(|_| error_message("ERR Invalid config epoch"))?;
+    let mut state = cluster.borrow_mut();
+    state.ensure_enabled()?;
+    if state.topology_ref()?.state().nodes().len() > 1 {
+        return Err(error_message(
+            "ERR The user can assign a config epoch only when the node does not know any other node",
+        ));
+    }
+    if state
+        .local_meta()
+        .is_some_and(|node| node.config_epoch != 0)
+    {
+        return Err(error_message("ERR Node config epoch is already non-zero"));
+    }
+    let topology = state.topology_mut_ref()?;
+    topology.state_mut().set_current_epoch(epoch);
+    let local_id = topology.state().local_node_id();
+    if let Some(local) = topology.state_mut().get_node_mut(&local_id) {
+        local.config_epoch = epoch;
+    }
     Ok(ok_outcome(simple_string(b"OK")))
 }
 
@@ -1052,6 +1168,48 @@ fn cluster_replicas(
     Ok(ok_outcome(bulk_string(text.as_bytes())))
 }
 
+fn cluster_help(args: &[Frame<'_>], resp3: bool) -> Result<ClusterCommandOutcome, Vec<u8>> {
+    if !args.is_empty() {
+        return Err(error_message(
+            "ERR wrong number of arguments for 'cluster|help' command",
+        ));
+    }
+    const HELP: [&[u8]; 28] = [
+        b"ADDSLOTS slot [slot ...]",
+        b"ADDSLOTSRANGE start end [start end ...]",
+        b"BUMPEPOCH",
+        b"COUNTKEYSINSLOT slot",
+        b"COUNT-FAILURE-REPORTS node-id",
+        b"DELSLOTS slot [slot ...]",
+        b"DELSLOTSRANGE start end [start end ...]",
+        b"FAILOVER [FORCE|TAKEOVER]",
+        b"FLUSHSLOTS",
+        b"FORGET node-id",
+        b"GETKEYSINSLOT slot count",
+        b"HELP",
+        b"INFO",
+        b"KEYSLOT key",
+        b"LINKS",
+        b"MEET ip port [bus-port]",
+        b"MYID",
+        b"MYSHARDID",
+        b"NODES",
+        b"REPLICAS node-id",
+        b"RESET [HARD|SOFT]",
+        b"REPLICATE node-id",
+        b"SAVECONFIG",
+        b"SET-CONFIG-EPOCH epoch",
+        b"SETSLOT slot NODE node-id|IMPORTING node-id|MIGRATING node-id|STABLE",
+        b"SHARDS",
+        b"SLOTS",
+        b"SLAVES node-id",
+    ];
+    Ok(ok_outcome(serialize_response(
+        &Response::Array(Box::new(HELP.into_iter().map(bulk_value).collect())),
+        resp3,
+    )))
+}
+
 fn update_local_slots(
     cluster: &Rc<RefCell<ClusterCommandState>>,
     slots: &[u16],
@@ -1211,6 +1369,60 @@ fn format_cluster_info(state: &ClusterCommandState) -> String {
         let _ = writeln!(out, "{key}:{value}\r");
     }
     out
+}
+
+fn build_slots_response(state: &ClusterCommandState) -> Response {
+    let Some(topology) = state.topology() else {
+        return Response::Array(Box::default());
+    };
+    let nodes = topology.state().nodes();
+    let owners = state.all_slot_owners();
+    let mut ranges = SmallVec::<[Response; 16]>::new();
+    let mut slot = 0usize;
+    while slot < owners.len() {
+        let Some((primary_id, _)) = owners[slot] else {
+            slot += 1;
+            continue;
+        };
+        let start = slot;
+        let mut end = slot;
+        while end + 1 < owners.len()
+            && owners[end + 1]
+                .map(|(node_id, _)| node_id == primary_id)
+                .unwrap_or(false)
+        {
+            end += 1;
+        }
+        if let Some(primary) = nodes.get(&primary_id) {
+            let mut range = SmallVec::<[Response; 16]>::new();
+            range.push(Response::Integer(start as i64));
+            range.push(Response::Integer(end as i64));
+            range.push(cluster_slot_node(primary));
+            let mut replicas = nodes
+                .values()
+                .filter(
+                    |node| matches!(node.role, NodeRole::Replica { primary } if primary == primary_id),
+                )
+                .collect::<Vec<_>>();
+            replicas.sort_by_key(|node| node.id);
+            range.extend(replicas.into_iter().map(cluster_slot_node));
+            ranges.push(Response::Array(Box::new(range)));
+        }
+        slot = end + 1;
+    }
+    Response::Array(Box::new(ranges))
+}
+
+fn cluster_slot_node(node: &NodeMeta) -> Response {
+    Response::Array(Box::new(
+        [
+            bulk_value(node.addr.ip().to_string().as_bytes()),
+            Response::Integer(i64::from(node.addr.port())),
+            bulk_value(node.id.to_string().as_bytes()),
+        ]
+        .into_iter()
+        .collect(),
+    ))
 }
 
 fn format_cluster_nodes(state: &ClusterCommandState, filter_primary: Option<NodeId>) -> String {
@@ -1449,6 +1661,13 @@ fn parse_ip(raw: &[u8]) -> Result<IpAddr, ()> {
 }
 
 fn parse_u16(raw: &[u8]) -> Result<u16, ()> {
+    std::str::from_utf8(raw)
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .ok_or(())
+}
+
+fn parse_u64(raw: &[u8]) -> Result<u64, ()> {
     std::str::from_utf8(raw)
         .ok()
         .and_then(|text| text.parse().ok())
@@ -1749,5 +1968,105 @@ mod tests {
         .unwrap();
         assert!(String::from_utf8_lossy(&count.response).contains(":1"));
         assert!(String::from_utf8_lossy(&keys.response).contains("{tenant}:a"));
+    }
+
+    #[test]
+    fn cluster_keyslot_matches_crc16() {
+        let cluster = enabled_state();
+        let store = Rc::new(RefCell::new(Store::new(None)));
+        let key = b"{tenant}:profile";
+        let outcome =
+            dispatch_cluster(&[bs(b"KEYSLOT"), bs(key)], true, &cluster, &store, None).unwrap();
+        assert!(
+            String::from_utf8_lossy(&outcome.response)
+                .contains(&format!(":{}", senko_cluster::crc16_slot(key)))
+        );
+    }
+
+    #[test]
+    fn cluster_slots_reports_primary_and_replica_ranges() {
+        let cluster = enabled_state();
+        {
+            let mut state = cluster.borrow_mut();
+            let primary_id = state.local_node_id().unwrap();
+            for slot in 0..3 {
+                state.set_local_slot_owned(slot, true).unwrap();
+            }
+            let mut replica = NodeMeta::new(
+                senko_cluster::NodeId::new([5; 20]),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6385),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 16385),
+            );
+            replica.role = NodeRole::Replica {
+                primary: primary_id,
+            };
+            state
+                .topology_mut_ref()
+                .unwrap()
+                .state_mut()
+                .insert_node(replica);
+            state.rebuild_topology().unwrap();
+        }
+        let store = Rc::new(RefCell::new(Store::new(None)));
+        let outcome = dispatch_cluster(&[bs(b"SLOTS")], true, &cluster, &store, None).unwrap();
+        let rendered = String::from_utf8_lossy(&outcome.response);
+        assert!(rendered.contains(":0"));
+        assert!(rendered.contains(":2"));
+        assert!(rendered.contains("127.0.0.1"));
+        assert!(rendered.contains("6385"));
+    }
+
+    #[test]
+    fn cluster_help_lists_slots_and_keyslot() {
+        let cluster = enabled_state();
+        let store = Rc::new(RefCell::new(Store::new(None)));
+        let outcome = dispatch_cluster(&[bs(b"HELP")], true, &cluster, &store, None).unwrap();
+        let rendered = String::from_utf8_lossy(&outcome.response);
+        assert!(rendered.contains("SLOTS"));
+        assert!(rendered.contains("KEYSLOT"));
+        assert!(rendered.contains("SLAVES"));
+        assert!(rendered.contains("BUMPEPOCH"));
+    }
+
+    #[test]
+    fn cluster_bumpepoch_advances_local_epoch() {
+        let cluster = enabled_state();
+        let store = Rc::new(RefCell::new(Store::new(None)));
+        let before = cluster.borrow().local_meta().unwrap().config_epoch;
+        let outcome = dispatch_cluster(&[bs(b"BUMPEPOCH")], true, &cluster, &store, None).unwrap();
+        assert_eq!(String::from_utf8(outcome.response).unwrap(), "+BUMPED\r\n");
+        assert!(cluster.borrow().local_meta().unwrap().config_epoch > before);
+    }
+
+    #[test]
+    fn cluster_count_failure_reports_defaults_to_zero() {
+        let cluster = enabled_state();
+        let store = Rc::new(RefCell::new(Store::new(None)));
+        let node_id = cluster.borrow().local_node_id().unwrap().to_string();
+        let outcome = dispatch_cluster(
+            &[bs(b"COUNT-FAILURE-REPORTS"), bs(node_id.as_bytes())],
+            true,
+            &cluster,
+            &store,
+            None,
+        )
+        .unwrap();
+        assert!(String::from_utf8_lossy(&outcome.response).contains(":0"));
+    }
+
+    #[test]
+    fn cluster_set_config_epoch_updates_single_node_epoch() {
+        let cluster = enabled_state();
+        let store = Rc::new(RefCell::new(Store::new(None)));
+        let outcome = dispatch_cluster(
+            &[bs(b"SET-CONFIG-EPOCH"), bs(b"42")],
+            true,
+            &cluster,
+            &store,
+            None,
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(outcome.response).unwrap(), "+OK\r\n");
+        assert_eq!(cluster.borrow().local_meta().unwrap().config_epoch, 42);
     }
 }

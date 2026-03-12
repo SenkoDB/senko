@@ -646,6 +646,38 @@ pub fn sentinel_config_set(
     Ok(())
 }
 
+pub fn apply_global_override(
+    config: &mut SentinelConfig,
+    option: &str,
+    value: &str,
+) -> Result<(), SentinelError> {
+    apply_global_mutation(config, option, value)?;
+    config.validate()
+}
+
+pub fn apply_master_override(
+    config: &mut SentinelConfig,
+    master_name: &str,
+    option: &str,
+    value: &str,
+) -> Result<(), SentinelError> {
+    apply_master_mutation(config, master_name, option, value)?;
+    config.validate()
+}
+
+pub fn upsert_master(
+    config: &mut SentinelConfig,
+    master: MasterConfig,
+) -> Result<(), SentinelError> {
+    validate_master(&master)?;
+    if let Some(existing) = config.find_master_mut(&master.name) {
+        *existing = master;
+    } else {
+        config.masters.push(master);
+    }
+    config.validate()
+}
+
 fn apply_master_mutation(
     config: &mut SentinelConfig,
     master_name: &str,

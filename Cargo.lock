@@ -2444,6 +2444,7 @@ dependencies = [
  "bitflags",
  "blake3 1.8.2",
  "bytes",
+ "clap",
  "compact_str",
  "compio",
  "futures-util",

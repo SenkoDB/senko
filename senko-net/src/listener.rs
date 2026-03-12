@@ -31,6 +31,7 @@ use crate::{
     commands::server::config as live_config,
     commands::server::diagnostics as server_diagnostics,
     commands::server::info as server_info,
+    commands::server::replication as server_replication,
     connection::{ClientConnectionMap, Connection},
     pubsub::fanout::{CrossShardBus, ShardFanOut},
     transaction::{ConnectionMap, WatchRegistry},
@@ -88,9 +89,10 @@ pub async fn run_shard(
     crate::modules::init(Arc::clone(&module_registry));
     live_config::init(&config);
     command_info::init(&config);
-    acl::init(&config);
+    acl::init(&config)?;
     server_diagnostics::init(&config);
     server_info::init(&config);
+    server_replication::init(&config);
     let listener = prepared.into_compio()?;
     let store = Rc::new(RefCell::new(Store::new(config.max_memory)));
     let engine = Rc::new(RefCell::new(

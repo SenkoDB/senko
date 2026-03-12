@@ -744,6 +744,14 @@ impl ReplicaAckTracker {
         }
     }
 
+    pub fn remove_replica(&self, replica_id: &NodeId) {
+        if let Ok(mut state) = self.state.lock() {
+            if state.offsets.remove(replica_id).is_some() {
+                self.cv.notify_all();
+            }
+        }
+    }
+
     pub fn acknowledged_offset(&self, replica_id: &NodeId) -> u64 {
         self.state
             .lock()

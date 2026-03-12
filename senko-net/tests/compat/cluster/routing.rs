@@ -54,3 +54,27 @@ fn cross_slot_detection_matches_hash_tag_behavior() {
     assert!(!same_slot(&[b"foo", b"baz"]));
     assert!(same_slot(&[b"{tag}foo", b"{tag}baz"]));
 }
+
+#[test]
+fn cluster_keyslot_matches_hash_algorithm() {
+    let harness = ClusterHarness::start(3, 0);
+    let key = b"{tenant}:session";
+    let response = harness
+        .execute_cluster(
+            0,
+            &["KEYSLOT", std::str::from_utf8(key).expect("utf8 test key")],
+        )
+        .expect("cluster keyslot");
+    assert!(String::from_utf8_lossy(&response).contains(&format!(":{}", crc16_slot(key))));
+}
+
+#[test]
+fn cluster_slots_lists_assigned_ranges() {
+    let harness = ClusterHarness::start(3, 0);
+    let response = harness
+        .execute_cluster(0, &["SLOTS"])
+        .expect("cluster slots");
+    let rendered = String::from_utf8_lossy(&response);
+    assert!(rendered.contains("127.0.0.1"));
+    assert!(rendered.contains("7300") || rendered.contains("7301") || rendered.contains("7302"));
+}

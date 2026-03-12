@@ -1,136 +1,62 @@
 use std::{
+    collections::BTreeMap,
     env,
+    ffi::OsString,
     path::{Path, PathBuf},
-    str::FromStr,
 };
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Arg, ArgAction, ArgMatches, Command, value_parser};
 use senko_core::{
-    ByteSize, ConfigError, SenkoConfig, config_set, load_config, parse_replica_of, validate_config,
+    ConfigError, SenkoConfig, config::CONFIG_ALIASES, config_set_startup, load_config,
+    validate_config,
 };
-
-#[derive(Parser, Debug)]
-#[command(
-    name = "senkodb",
-    version = env!("CARGO_PKG_VERSION"),
-    about = "Senko — a flash of light in the darkness. Redis-compatible in-memory store.",
-    long_about = None,
-)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cli {
-    #[arg(
-        short = 'c',
-        long,
-        value_name = "FILE",
-        env = "SENKO_CONFIG",
-        help = "Path to senko.toml config file"
-    )]
     pub config: Option<PathBuf>,
-
-    #[arg(
-        long,
-        value_name = "FILE",
-        env = "SENKO_SENTINEL",
-        help = "Path to sentinel.toml config file"
-    )]
-    pub sentinel: Option<PathBuf>,
-
-    #[command(flatten)]
-    pub overrides: CliOverrides,
-
-    #[command(subcommand)]
     pub command: Option<Commands>,
+    pub overrides: Vec<CliOverride>,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliOverride {
+    pub key: String,
+    pub values: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Commands {
     Start,
     CheckConfig {
-        #[arg(value_name = "FILE")]
         file: PathBuf,
     },
     DefaultConfig,
     Version,
     ConvertConfig {
-        #[arg(value_name = "REDIS_CONF")]
         input: PathBuf,
-        #[arg(short, long, value_name = "OUTPUT")]
         output: Option<PathBuf>,
     },
 }
 
-#[derive(Args, Debug, Default)]
-pub struct CliOverrides {
-    #[arg(long, env = "SENKO_PORT", help = "TCP port (default: 6379)")]
-    pub port: Option<u16>,
-    #[arg(
-        long,
-        env = "SENKO_BIND",
-        help = "Bind address (repeatable: --bind 0.0.0.0 --bind ::)"
-    )]
-    pub bind: Vec<String>,
-    #[arg(
-        long,
-        env = "SENKO_IO_THREADS",
-        help = "Number of I/O threads (default: logical CPU count)"
-    )]
-    pub io_threads: Option<usize>,
-    #[arg(long, env = "SENKO_UNIXSOCKET", help = "Unix socket path")]
-    pub unixsocket: Option<PathBuf>,
-    #[arg(
-        long,
-        env = "SENKO_REQUIREPASS",
-        help = "Password (sets default user password)"
-    )]
-    pub requirepass: Option<String>,
-    #[arg(long, env = "SENKO_ACLFILE", help = "Path to ACL file")]
-    pub aclfile: Option<PathBuf>,
-    #[arg(long, env = "SENKO_MAXMEMORY", help = "Max memory (e.g. 1gb, 512mb)")]
-    pub maxmemory: Option<String>,
-    #[arg(long, env = "SENKO_MAXMEMORY_POLICY", help = "Eviction policy")]
-    pub maxmemory_policy: Option<String>,
-    #[arg(long, env = "SENKO_DIR", help = "Working directory for RDB/AOF")]
-    pub dir: Option<PathBuf>,
-    #[arg(
-        long,
-        env = "SENKO_DBFILENAME",
-        help = "RDB filename (default: dump.rdb)"
-    )]
-    pub dbfilename: Option<String>,
-    #[arg(long, env = "SENKO_SAVE", help = "Disable RDB saves (--no-save)")]
-    pub no_save: bool,
-    #[arg(
-        long,
-        env = "SENKO_REPLICAOF",
-        value_name = "HOST:PORT",
-        help = "Replicate from master (e.g. 10.0.0.1:6379)"
-    )]
-    pub replicaof: Option<String>,
-    #[arg(long, env = "SENKO_CLUSTER_ENABLED", help = "Enable cluster mode")]
-    pub cluster_enabled: bool,
-    #[arg(
-        long,
-        env = "SENKO_LOGLEVEL",
-        help = "Log level: debug|verbose|notice|warning|nothing"
-    )]
-    pub loglevel: Option<String>,
-    #[arg(long, env = "SENKO_LOGFILE", help = "Log file path (default: stdout)")]
-    pub logfile: Option<PathBuf>,
-    #[arg(long, env = "SENKO_TLS_PORT", help = "TLS port (0 = disabled)")]
-    pub tls_port: Option<u16>,
-    #[arg(long, env = "SENKO_TLS_CERT_FILE")]
-    pub tls_cert_file: Option<PathBuf>,
-    #[arg(long, env = "SENKO_TLS_KEY_FILE")]
-    pub tls_key_file: Option<PathBuf>,
-    #[arg(long, help = "Daemonize the server")]
-    pub daemonize: bool,
-    #[arg(long, env = "SENKO_HZ", help = "Event loop frequency (default: 10)")]
-    pub hz: Option<u32>,
-    #[arg(
-        long,
-        env = "SENKO_PLUGINS",
-        help = "Enable plugins (comma-separated: json,bloom)"
-    )]
-    pub plugins: Option<String>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServerOptionSpec {
+    key: String,
+    long: String,
+    aliases: Vec<String>,
+}
+
+impl Cli {
+    pub fn parse() -> Self {
+        Self::try_parse_from(env::args_os()).unwrap_or_else(|error| error.exit())
+    }
+
+    pub fn try_parse_from<I, T>(args: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        let matches = build_command().try_get_matches_from(args)?;
+        Ok(parse_matches(&matches))
+    }
 }
 
 pub fn resolve_config_path(cli: &Cli) -> Option<PathBuf> {
@@ -149,6 +75,7 @@ pub fn auto_detect_config_path() -> Option<PathBuf> {
     }
     let candidates = [
         PathBuf::from("./senko.toml"),
+        PathBuf::from("./redis.conf"),
         PathBuf::from("/etc/senko/senko.toml"),
         dirs_config_home().join("senko/senko.toml"),
     ];
@@ -156,7 +83,6 @@ pub fn auto_detect_config_path() -> Option<PathBuf> {
 }
 
 pub fn load_effective_config(cli: &Cli) -> Result<SenkoConfig, ConfigError> {
-    let _ = apply_cli_overrides as fn(&mut SenkoConfig, &CliOverrides);
     let path = resolve_config_path(cli);
     let mut config = load_config(path.as_deref())?;
     apply_cli_overrides_checked(&mut config, &cli.overrides)?;
@@ -164,84 +90,374 @@ pub fn load_effective_config(cli: &Cli) -> Result<SenkoConfig, ConfigError> {
     Ok(config)
 }
 
-pub fn apply_cli_overrides(config: &mut SenkoConfig, overrides: &CliOverrides) {
-    apply_cli_overrides_checked(config, overrides).expect("invalid CLI overrides")
-}
-
 pub fn apply_cli_overrides_checked(
     config: &mut SenkoConfig,
-    overrides: &CliOverrides,
+    overrides: &[CliOverride],
 ) -> Result<(), ConfigError> {
-    if let Some(port) = overrides.port {
-        config.network.port = port;
-    }
-    if !overrides.bind.is_empty() {
-        config.network.bind = overrides.bind.clone();
-    }
-    if let Some(io_threads) = overrides.io_threads {
-        config.network.io_threads = io_threads;
-    }
-    if let Some(unixsocket) = &overrides.unixsocket {
-        config.network.unixsocket = Some(unixsocket.clone());
-    }
-    if let Some(requirepass) = &overrides.requirepass {
-        config.security.requirepass = Some(requirepass.clone());
-    }
-    if let Some(aclfile) = &overrides.aclfile {
-        config.security.aclfile = Some(aclfile.clone());
-    }
-    if let Some(maxmemory) = &overrides.maxmemory {
-        config.memory.maxmemory =
-            ByteSize::from_str(maxmemory).map_err(ConfigError::ValidationError)?;
-    }
-    if let Some(policy) = &overrides.maxmemory_policy {
-        config_set(config, "memory.maxmemory_policy", policy)?;
-    }
-    if let Some(dir) = &overrides.dir {
-        config.persistence.dir = dir.clone();
-    }
-    if let Some(dbfilename) = &overrides.dbfilename {
-        config.persistence.dbfilename = dbfilename.clone();
-    }
-    if overrides.no_save {
-        config.persistence.save.clear();
-    }
-    if let Some(replicaof) = &overrides.replicaof {
-        config.replication.replicaof = Some(parse_replica_of(replicaof)?);
-    }
-    if overrides.cluster_enabled {
-        config.cluster.enabled = true;
-    }
-    if let Some(loglevel) = &overrides.loglevel {
-        config_set(config, "general.loglevel", loglevel)?;
-    }
-    if let Some(logfile) = &overrides.logfile {
-        config.general.logfile = Some(logfile.clone());
-    }
-    if let Some(port) = overrides.tls_port {
-        config.tls.port = port;
-    }
-    if let Some(cert) = &overrides.tls_cert_file {
-        config.tls.cert_file = Some(cert.clone());
-    }
-    if let Some(key) = &overrides.tls_key_file {
-        config.tls.key_file = Some(key.clone());
-    }
-    if overrides.daemonize {
-        config.general.daemonize = true;
-    }
-    if let Some(hz) = overrides.hz {
-        config.general.hz = hz;
-    }
-    if let Some(plugins) = &overrides.plugins {
-        config.plugins.enabled = plugins
-            .split(',')
-            .filter(|item| !item.trim().is_empty())
-            .map(|item| item.trim().to_owned())
-            .collect();
+    for override_ in overrides {
+        let value = render_override_value(override_);
+        config_set_startup(config, &override_.key, &value)?;
     }
     Ok(())
 }
+
+fn build_command() -> Command {
+    let mut command = Command::new("senkodb")
+        .version(env!("CARGO_PKG_VERSION"))
+        .about("Senko — a flash of light in the darkness. Redis-compatible in-memory store.")
+        .arg(
+            Arg::new("config")
+                .short('c')
+                .long("config")
+                .value_name("FILE")
+                .env("SENKO_CONFIG")
+                .value_parser(value_parser!(PathBuf))
+                .help("Path to senko.toml or redis.conf"),
+        )
+        .arg(
+            Arg::new("config-path")
+                .value_name("FILE")
+                .value_parser(value_parser!(PathBuf))
+                .conflicts_with("config")
+                .help("Config file path (Redis-compatible positional form)"),
+        )
+        .subcommand(Command::new("start"))
+        .subcommand(
+            Command::new("check-config").arg(
+                Arg::new("file")
+                    .value_name("FILE")
+                    .required(true)
+                    .value_parser(value_parser!(PathBuf)),
+            ),
+        )
+        .subcommand(Command::new("default-config"))
+        .subcommand(Command::new("version"))
+        .subcommand(
+            Command::new("convert-config")
+                .arg(
+                    Arg::new("input")
+                        .value_name("REDIS_CONF")
+                        .required(true)
+                        .value_parser(value_parser!(PathBuf)),
+                )
+                .arg(
+                    Arg::new("output")
+                        .short('o')
+                        .long("output")
+                        .value_name("OUTPUT")
+                        .value_parser(value_parser!(PathBuf)),
+                ),
+        );
+
+    for spec in server_option_specs() {
+        let mut arg = Arg::new(leak(spec.key.clone()))
+            .long(leak(spec.long.clone()))
+            .action(ArgAction::Append)
+            .num_args(1)
+            .allow_hyphen_values(true)
+            .env(leak(config_env_name(&spec.long)))
+            .value_name("VALUE")
+            .help("Override config value");
+        for alias in spec.aliases {
+            arg = arg.visible_alias(leak(alias));
+        }
+        command = command.arg(arg);
+    }
+
+    command
+}
+
+fn parse_matches(matches: &ArgMatches) -> Cli {
+    let config = matches
+        .get_one::<PathBuf>("config")
+        .cloned()
+        .or_else(|| matches.get_one::<PathBuf>("config-path").cloned());
+    let command = parse_command(matches);
+    let overrides = server_option_specs()
+        .into_iter()
+        .filter_map(|spec| {
+            matches
+                .get_many::<String>(&spec.key)
+                .map(|values| CliOverride {
+                    key: spec.key,
+                    values: values.cloned().collect(),
+                })
+        })
+        .collect();
+    Cli {
+        config,
+        command,
+        overrides,
+    }
+}
+
+fn parse_command(matches: &ArgMatches) -> Option<Commands> {
+    match matches.subcommand() {
+        Some(("start", _)) => Some(Commands::Start),
+        Some(("check-config", sub)) => Some(Commands::CheckConfig {
+            file: sub
+                .get_one::<PathBuf>("file")
+                .expect("required by clap")
+                .clone(),
+        }),
+        Some(("default-config", _)) => Some(Commands::DefaultConfig),
+        Some(("version", _)) => Some(Commands::Version),
+        Some(("convert-config", sub)) => Some(Commands::ConvertConfig {
+            input: sub
+                .get_one::<PathBuf>("input")
+                .expect("required by clap")
+                .clone(),
+            output: sub.get_one::<PathBuf>("output").cloned(),
+        }),
+        _ => None,
+    }
+}
+
+fn render_override_value(override_: &CliOverride) -> String {
+    match override_.key.as_str() {
+        "persistence.save" => override_.values.join(" "),
+        "security.client_output_buffer_limit" => override_.values.join(";"),
+        _ if override_.values.len() > 1 => override_.values.join(","),
+        _ => override_.values.last().cloned().unwrap_or_default(),
+    }
+}
+
+fn server_option_specs() -> Vec<ServerOptionSpec> {
+    let alias_groups = alias_groups();
+    SERVER_CONFIG_KEYS
+        .iter()
+        .copied()
+        .map(str::to_owned)
+        .map(|key| {
+            let aliases = alias_groups.get(key.as_str()).cloned().unwrap_or_default();
+            let canonical_flag = canonical_flag_name(&key);
+            let long = aliases
+                .iter()
+                .min_by_key(|alias| alias.len())
+                .cloned()
+                .unwrap_or_else(|| canonical_flag.clone());
+            let mut extra_aliases = aliases
+                .into_iter()
+                .filter(|alias| alias != &long)
+                .collect::<Vec<_>>();
+            if canonical_flag != long && !extra_aliases.iter().any(|alias| alias == &canonical_flag)
+            {
+                extra_aliases.push(canonical_flag);
+            }
+            ServerOptionSpec {
+                key,
+                long,
+                aliases: extra_aliases,
+            }
+        })
+        .collect()
+}
+
+fn alias_groups() -> BTreeMap<String, Vec<String>> {
+    let mut groups = BTreeMap::<String, Vec<String>>::new();
+    for (alias, canonical) in CONFIG_ALIASES.entries() {
+        groups
+            .entry((*canonical).to_owned())
+            .or_default()
+            .push((*alias).to_owned());
+    }
+    groups
+}
+
+fn canonical_flag_name(key: &str) -> String {
+    key.replace('.', "-").replace('_', "-")
+}
+
+fn config_env_name(long: &str) -> String {
+    format!("SENKO_{}", long.replace('-', "_").to_ascii_uppercase())
+}
+
+fn leak(text: String) -> &'static str {
+    Box::leak(text.into_boxed_str())
+}
+
+const SERVER_CONFIG_KEYS: &[&str] = &[
+    "network.bind",
+    "network.port",
+    "network.unixsocket",
+    "network.unixsocketperm",
+    "network.tcp_backlog",
+    "network.timeout",
+    "network.tcp_keepalive",
+    "network.protected_mode",
+    "network.bind_source_addr",
+    "network.io_threads",
+    "network.so_reuseport",
+    "network.max_new_connections_per_cycle",
+    "tls.port",
+    "tls.cert_file",
+    "tls.key_file",
+    "tls.key_file_pass",
+    "tls.ca_cert_file",
+    "tls.ca_cert_dir",
+    "tls.auth_clients",
+    "tls.auth_clients_user",
+    "tls.replication",
+    "tls.cluster",
+    "tls.protocols",
+    "tls.ciphers",
+    "tls.ciphersuites",
+    "tls.prefer_server_ciphers",
+    "tls.session_caching",
+    "tls.session_cache_size",
+    "tls.session_cache_timeout",
+    "general.daemonize",
+    "general.pidfile",
+    "general.loglevel",
+    "general.logfile",
+    "general.syslog_enabled",
+    "general.syslog_ident",
+    "general.syslog_facility",
+    "general.databases",
+    "general.always_show_logo",
+    "general.set_proc_title",
+    "general.proc_title_template",
+    "general.hz",
+    "general.dynamic_hz",
+    "general.activerehashing",
+    "general.disable_thp",
+    "general.oom_score_adj",
+    "general.oom_score_adj_values",
+    "general.include",
+    "general.ignore_warnings",
+    "security.requirepass",
+    "security.aclfile",
+    "security.acllog_max_len",
+    "security.acl_pubsub_default",
+    "security.users",
+    "security.enable_protected_configs",
+    "security.enable_debug_command",
+    "security.enable_module_command",
+    "security.client_output_buffer_limit",
+    "security.client_query_buffer_limit",
+    "security.proto_max_bulk_len",
+    "security.tracking_table_max_keys",
+    "persistence.save",
+    "persistence.stop_writes_on_bgsave_error",
+    "persistence.rdbcompression",
+    "persistence.rdbchecksum",
+    "persistence.dbfilename",
+    "persistence.dir",
+    "persistence.rdb_del_sync_files",
+    "persistence.sanitize_dump_payload",
+    "replication.replicaof",
+    "replication.masterauth",
+    "replication.masteruser",
+    "replication.replica_serve_stale_data",
+    "replication.replica_read_only",
+    "replication.repl_diskless_sync",
+    "replication.repl_diskless_sync_delay",
+    "replication.repl_diskless_sync_max_replicas",
+    "replication.repl_diskless_load",
+    "replication.repl_ping_replica_period",
+    "replication.repl_timeout",
+    "replication.repl_disable_tcp_nodelay",
+    "replication.repl_backlog_size",
+    "replication.repl_backlog_ttl",
+    "replication.replica_priority",
+    "replication.min_replicas_to_write",
+    "replication.min_replicas_max_lag",
+    "replication.replica_announce_ip",
+    "replication.replica_announce_port",
+    "replication.propagation_error_behavior",
+    "replication.replica_ignore_maxmemory",
+    "replication.replica_full_sync_buffer_limit",
+    "replication.shutdown_timeout",
+    "cluster.enabled",
+    "cluster.config_file",
+    "cluster.node_timeout",
+    "cluster.port",
+    "cluster.replica_validity_factor",
+    "cluster.migration_barrier",
+    "cluster.allow_replica_migration",
+    "cluster.require_full_coverage",
+    "cluster.replica_no_failover",
+    "cluster.allow_reads_when_down",
+    "cluster.allow_pubsubshard_when_down",
+    "cluster.link_sendbuf_limit",
+    "cluster.announce_ip",
+    "cluster.announce_port",
+    "cluster.announce_tls_port",
+    "cluster.announce_bus_port",
+    "cluster.announce_hostname",
+    "cluster.announce_human_nodename",
+    "cluster.preferred_endpoint_type",
+    "cluster.compatibility_sample_ratio",
+    "cluster.slot_stats_enabled",
+    "cluster.slot_migration_write_pause_timeout",
+    "cluster.slot_migration_handoff_max_lag_bytes",
+    "memory.maxmemory",
+    "memory.maxmemory_policy",
+    "memory.maxmemory_samples",
+    "memory.maxmemory_eviction_tenacity",
+    "memory.maxclients",
+    "memory.maxmemory_clients",
+    "memory.activedefrag",
+    "memory.active_defrag_ignore_bytes",
+    "memory.active_defrag_threshold_lower",
+    "memory.active_defrag_threshold_upper",
+    "memory.active_defrag_cycle_min",
+    "memory.active_defrag_cycle_max",
+    "memory.active_defrag_max_scan_fields",
+    "memory.lfu_log_factor",
+    "memory.lfu_decay_time",
+    "memory.active_expire_effort",
+    "memory.jemalloc_bg_thread",
+    "memory.server_cpulist",
+    "memory.bio_cpulist",
+    "memory.aof_rewrite_cpulist",
+    "memory.bgsave_cpulist",
+    "encoding.hash_max_listpack_entries",
+    "encoding.hash_max_listpack_value",
+    "encoding.list_max_listpack_size",
+    "encoding.list_compress_depth",
+    "encoding.set_max_intset_entries",
+    "encoding.set_max_listpack_entries",
+    "encoding.set_max_listpack_value",
+    "encoding.zset_max_listpack_entries",
+    "encoding.zset_max_listpack_value",
+    "encoding.hll_sparse_max_bytes",
+    "encoding.stream_node_max_bytes",
+    "encoding.stream_node_max_entries",
+    "encoding.stream_idmp_duration",
+    "encoding.stream_idmp_maxsize",
+    "pubsub.notify_keyspace_events",
+    "pubsub.subscriber_ring_size",
+    "slowlog.log_slower_than",
+    "slowlog.max_len",
+    "latency.monitor_threshold",
+    "latency.tracking",
+    "latency.tracking_info_percentiles",
+    "clients.lookahead",
+    "clients.key_memory_histograms",
+    "lazyfree.lazy_eviction",
+    "lazyfree.lazy_expire",
+    "lazyfree.lazy_server_del",
+    "lazyfree.replica_lazy_flush",
+    "lazyfree.lazy_user_del",
+    "lazyfree.lazy_user_flush",
+    "aof.enabled",
+    "aof.filename",
+    "aof.dirname",
+    "aof.fsync",
+    "aof.no_appendfsync_on_rewrite",
+    "aof.auto_aof_rewrite_percentage",
+    "aof.auto_aof_rewrite_min_size",
+    "aof.aof_load_truncated",
+    "aof.aof_load_corrupt_tail_max_size",
+    "aof.aof_use_rdb_preamble",
+    "aof.aof_timestamp_enabled",
+    "aof.aof_rewrite_incremental_fsync",
+    "aof.rdb_save_incremental_fsync",
+    "aof.shutdown_on_sigint",
+    "aof.shutdown_on_sigterm",
+    "plugins.enabled",
+];
 
 fn dirs_config_home() -> PathBuf {
     env::var_os("HOME")
@@ -259,42 +475,78 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cli_flag_wins_over_env_and_file() {
-        let mut config = SenkoConfig::default();
-        config.network.port = 7000;
-        let overrides = CliOverrides {
-            port: Some(6380),
-            ..CliOverrides::default()
-        };
-        apply_cli_overrides_checked(&mut config, &overrides).unwrap();
-        assert_eq!(config.network.port, 6380);
+    fn parses_alias_and_canonical_flags() {
+        let cli = Cli::try_parse_from([
+            "senkodb",
+            "--port",
+            "6380",
+            "--tls-session-cache-size",
+            "4096",
+        ])
+        .expect("parse");
+
+        assert!(
+            cli.overrides
+                .iter()
+                .any(|item| item.key == "network.port" && item.values == vec!["6380".to_owned()])
+        );
+        assert!(cli.overrides.iter().any(|item| {
+            item.key == "tls.session_cache_size" && item.values == vec!["4096".to_owned()]
+        }));
     }
 
     #[test]
-    fn no_save_clears_schedule() {
+    fn repeated_values_are_joined_for_lists() {
+        let cli = Cli::try_parse_from([
+            "senkodb",
+            "--bind",
+            "127.0.0.1",
+            "--bind",
+            "::1",
+            "--save",
+            "60 1",
+            "--save",
+            "300 10",
+        ])
+        .expect("parse");
+
         let mut config = SenkoConfig::default();
-        config.persistence.save.push(senko_core::config::SavePoint {
-            seconds: 60,
-            changes: 1,
-        });
-        let overrides = CliOverrides {
-            no_save: true,
-            ..CliOverrides::default()
-        };
-        apply_cli_overrides_checked(&mut config, &overrides).unwrap();
-        assert!(config.persistence.save.is_empty());
+        apply_cli_overrides_checked(&mut config, &cli.overrides).expect("apply");
+        assert_eq!(
+            config.network.bind,
+            vec!["127.0.0.1".to_owned(), "::1".to_owned()]
+        );
+        assert_eq!(config.persistence.save.len(), 2);
     }
 
     #[test]
-    fn replicaof_is_parsed() {
+    fn negative_numeric_values_parse_through_cli() {
+        let cli = Cli::try_parse_from([
+            "senkodb",
+            "--list-max-listpack-size",
+            "-2",
+            "--general-oom-score-adj-values",
+            "0,200,800",
+        ])
+        .expect("parse");
+
         let mut config = SenkoConfig::default();
-        let overrides = CliOverrides {
-            replicaof: Some("10.0.0.1:6379".to_owned()),
-            ..CliOverrides::default()
-        };
-        apply_cli_overrides_checked(&mut config, &overrides).unwrap();
-        let replica = config.replication.replicaof.unwrap();
-        assert_eq!(replica.host, "10.0.0.1");
-        assert_eq!(replica.port, 6379);
+        apply_cli_overrides_checked(&mut config, &cli.overrides).expect("apply");
+        assert_eq!(config.encoding.list_max_listpack_size, -2);
+        assert_eq!(config.general.oom_score_adj_values, [0, 200, 800]);
+    }
+
+    #[test]
+    fn positional_config_path_is_supported() {
+        let cli = Cli::try_parse_from(["senkodb", "./redis.conf"]).expect("parse");
+        assert_eq!(cli.config, Some(PathBuf::from("./redis.conf")));
+    }
+
+    #[test]
+    fn unknown_flag_still_errors() {
+        use clap::error::ErrorKind;
+
+        let error = Cli::try_parse_from(["senkodb", "--does-not-exist"]).expect_err("should fail");
+        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
     }
 }
