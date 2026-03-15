@@ -79,6 +79,11 @@ fn dispatch_client(
         ));
     };
     let subcommand = frame_bytes(subcommand).map_err(|error| error_bytes(&error))?;
+    meta.last_cmd = Some(CompactString::from(format!(
+        "client|{}",
+        String::from_utf8_lossy(subcommand).to_ascii_lowercase()
+    )));
+    meta.last_cmd_at = current_unix_ms();
 
     if eq_ascii(subcommand, b"ID") {
         return client_id(rest, meta);
@@ -154,7 +159,7 @@ fn dispatch_client(
     }
 
     Err(error_message(&format!(
-        "ERR unknown subcommand '{}' for 'CLIENT' command",
+        "ERR unknown subcommand '{}'. Try CLIENT HELP.",
         String::from_utf8_lossy(subcommand)
     )))
 }
@@ -346,7 +351,7 @@ fn client_caching(
         || (!meta.tracking_optin && !meta.tracking_optout)
     {
         return Err(error_message(
-            "ERR This command is not allowed when the client is not in tracking mode with the OPTIN or OPTOUT mode enabled",
+            "ERR CLIENT CACHING can be called only when the client is in tracking mode with OPTIN or OPTOUT mode enabled",
         ));
     }
     let mode = frame_bytes(mode).map_err(|error| error_bytes(&error))?;

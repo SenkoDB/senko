@@ -70,8 +70,18 @@ fn flush(conn: &mut Connection) {
 
 fn assert_err_contains<T: std::fmt::Debug>(result: RedisResult<T>, expected: &str) {
     let err = result.unwrap_err();
+    let rendered = err.to_string();
+    let normalized = expected.strip_prefix("ERR ").unwrap_or(expected);
+    let redis_rs_rendered = rendered
+        .strip_prefix('"')
+        .and_then(|value| value.split_once("\": "))
+        .map(|(kind, message)| format!("{kind} {message}"));
     assert!(
-        err.to_string().contains(expected),
+        rendered.contains(expected)
+            || rendered.contains(normalized)
+            || redis_rs_rendered
+                .as_ref()
+                .is_some_and(|value| value.contains(expected) || value.contains(normalized)),
         "expected error containing {expected:?}, got {err}"
     );
 }
@@ -184,7 +194,7 @@ fn connection_reset_clears_state_compat() {
     expect_no_bytes(&mut stream);
 
     send_resp(&mut stream, &["RESET"]);
-    expect_no_bytes(&mut stream);
+    assert_eq!(read_text(&mut stream), "+RESET\r\n");
 
     send_resp(&mut stream, &["CLIENT", "GETNAME"]);
     assert_eq!(read_text(&mut stream), "$-1\r\n");
@@ -269,7 +279,7 @@ fn connection_auth_without_password_configured_compat() {
     let mut conn = must_connect();
     assert_err_contains(
         redis::cmd("AUTH").arg("anything").query::<Value>(&mut conn),
-        "ERR Client sent AUTH, but no password is set. Did you mean ACL SETUSER with >password?",
+        "ERR AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?",
     );
 }
 
@@ -415,7 +425,7 @@ fn client_basics_compat() {
         "name=myconn",
         "flags=",
         "db=0",
-        "cmd=client",
+        "cmd=client|info",
         "user=default",
         "library-name=redis-rs",
         "library-ver=1.0.0",
@@ -427,6 +437,15 @@ fn client_basics_compat() {
     assert!(list.contains(&format!("id={id_a}")));
     assert!(list.contains("name=myconn"));
     assert!(list.ends_with('\n'));
+
+    let filtered: String = redis::cmd("CLIENT")
+        .arg("LIST")
+        .arg("ID")
+        .arg(id_a)
+        .query(&mut conn_a)
+        .unwrap();
+    assert!(filtered.contains(&format!("id={id_a}")));
+    assert!(!filtered.contains(&format!("id={id_b}")));
 
     let normal_only: String = redis::cmd("CLIENT")
         .arg("LIST")
@@ -504,7 +523,7 @@ fn client_no_evict_caching_getredir_trackinginfo_compat() {
             .arg("CACHING")
             .arg("YES")
             .query::<Value>(&mut conn),
-        "ERR This command is not allowed when the client is not in tracking mode with the OPTIN or OPTOUT mode enabled",
+        "ERR CLIENT CACHING can be called only when the client is in tracking mode with OPTIN or OPTOUT mode enabled",
     );
 
     let redir: i64 = redis::cmd("CLIENT")
@@ -607,16 +626,17 @@ fn client_kill_compat() {
     assert_eq!(killed, 1);
     assert!(redis::cmd("PING").query::<String>(&mut conn_a).is_err());
 
-    let killed_maxage: i64 = redis::cmd("CLIENT")
-        .arg("KILL")
-        .arg("TYPE")
-        .arg("NORMAL")
-        .arg("MAXAGE")
-        .arg(0)
-        .query(&mut conn_b)
-        .unwrap();
-    assert!(killed_maxage >= 1);
-    assert!(redis::cmd("PING").query::<String>(&mut conn_c).is_err());
+    assert_err_contains(
+        redis::cmd("CLIENT")
+            .arg("KILL")
+            .arg("TYPE")
+            .arg("NORMAL")
+            .arg("MAXAGE")
+            .arg(0)
+            .query::<Value>(&mut conn_b),
+        "ERR maxage should be greater than 0",
+    );
+    let _: String = redis::cmd("PING").query(&mut conn_c).unwrap();
 }
 
 #[test]
@@ -985,7 +1005,7 @@ fn client_error_cases_compat() {
         redis::cmd("CLIENT")
             .arg("UNKNOWN_SUBCOMMAND")
             .query::<Value>(&mut conn),
-        "ERR unknown subcommand 'UNKNOWN_SUBCOMMAND' for 'CLIENT' command",
+        "ERR unknown subcommand 'UNKNOWN_SUBCOMMAND'. Try CLIENT HELP.",
     );
 
     assert_err_contains(
@@ -993,7 +1013,7 @@ fn client_error_cases_compat() {
             .arg("CACHING")
             .arg("YES")
             .query::<Value>(&mut conn),
-        "ERR This command is not allowed when the client is not in tracking mode with the OPTIN or OPTOUT mode enabled",
+        "ERR CLIENT CACHING can be called only when the client is in tracking mode with OPTIN or OPTOUT mode enabled",
     );
 
     assert_err_contains(
@@ -1003,6 +1023,6 @@ fn client_error_cases_compat() {
             .arg("BCAST")
             .arg("OPTIN")
             .query::<Value>(&mut conn),
-        "ERR You can't use BCAST and OPTIN/OPTOUT at the same time",
+        "ERR OPTIN and OPTOUT are not compatible with BCAST",
     );
 }

@@ -4,7 +4,7 @@ use std::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::BytesMut;
@@ -102,17 +102,24 @@ pub(crate) fn record_write(
     command: &[u8],
     args: &[Frame<'_>],
 ) {
-    let Some(shard) = runtime().and_then(|runtime| runtime.shard(shard_id)) else {
-        return;
-    };
-    let Ok(payload) = encode_command(command, args) else {
-        return;
-    };
-    let offset = shard
-        .backlog
-        .append_command(&payload)
-        .unwrap_or_else(|_| shard.backlog.backlog().head_offset());
-    meta.last_write_replication_offset = offset;
+    if let Some(offset) = record_routed_write(shard_id, command, args) {
+        meta.last_write_replication_offset = offset;
+    }
+}
+
+pub(crate) fn record_routed_write(
+    shard_id: usize,
+    command: &[u8],
+    args: &[Frame<'_>],
+) -> Option<u64> {
+    let shard = runtime().and_then(|runtime| runtime.shard(shard_id))?;
+    let payload = encode_command(command, args).ok()?;
+    Some(
+        shard
+            .backlog
+            .append_command(&payload)
+            .unwrap_or_else(|_| shard.backlog.backlog().head_offset()),
+    )
 }
 
 pub(crate) fn current_offset(shard_id: usize) -> u64 {
@@ -168,7 +175,7 @@ fn handle_wait(
     }
     let replicas = usize::try_from(parse_u64(&args[0])?)
         .map_err(|_| error_message("ERR value is not an integer or out of range"))?;
-    let timeout_ms = parse_u64(&args[1])?;
+    let timeout_ms = parse_wait_timeout_ms(&args[1])?;
     let acknowledged = runtime()
         .and_then(|runtime| runtime.shard(shard_id))
         .map(|shard| {
@@ -426,6 +433,34 @@ fn parse_u64(frame: &Frame<'_>) -> Result<u64, Vec<u8>> {
         .ok_or_else(|| error_message("ERR value is not an integer or out of range"))
 }
 
+fn parse_wait_timeout_ms(frame: &Frame<'_>) -> Result<u64, Vec<u8>> {
+    const WAIT_TIMEOUT_RANGE_ERROR: &str = "ERR timeout is not an integer or out of range";
+    let bytes = frame_bytes(frame).map_err(|error| error_bytes(&error))?;
+    let text = std::str::from_utf8(bytes).map_err(|_| error_message(WAIT_TIMEOUT_RANGE_ERROR))?;
+    let parsed = text
+        .parse::<i128>()
+        .map_err(|_| error_message(WAIT_TIMEOUT_RANGE_ERROR))?;
+    if parsed < 0 {
+        return Err(error_message("ERR timeout is negative"));
+    }
+    if parsed > i64::MAX as i128 {
+        return Err(error_message(WAIT_TIMEOUT_RANGE_ERROR));
+    }
+    let timeout_ms = parsed as u64;
+    let now_ms = current_unix_ms();
+    if timeout_ms > (i64::MAX as u64).saturating_sub(now_ms) {
+        return Err(error_message("ERR timeout is out of range"));
+    }
+    Ok(timeout_ms)
+}
+
+fn current_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 fn bulk_response(bytes: &[u8]) -> Response {
     Response::Value(Some(senko_core::SenkoValue::from(bytes)))
 }
@@ -518,7 +553,7 @@ mod tests {
         connection::{ConnectionFlags, ConnectionMeta, ReplyMode},
     };
 
-    use super::{FAILOVER_PENDING, execute};
+    use super::{FAILOVER_PENDING, execute, parse_wait_timeout_ms};
 
     fn bs<'a>(input: &'a [u8]) -> Frame<'a> {
         Frame::BulkString(input)
@@ -668,6 +703,30 @@ mod tests {
             String::from_utf8(result.unwrap_err())
                 .unwrap()
                 .contains("ERR cluster not enabled")
+        );
+    }
+
+    #[test]
+    fn wait_timeout_matches_redis_error_cases() {
+        let negative = parse_wait_timeout_ms(&bs(b"-1")).unwrap_err();
+        assert!(
+            String::from_utf8(negative)
+                .unwrap()
+                .contains("ERR timeout is negative")
+        );
+
+        let too_large = parse_wait_timeout_ms(&bs(b"9223372036854775808")).unwrap_err();
+        assert!(
+            String::from_utf8(too_large)
+                .unwrap()
+                .contains("ERR timeout is not an integer or out of range")
+        );
+
+        let overflow = parse_wait_timeout_ms(&bs(b"9223372036854775807")).unwrap_err();
+        assert!(
+            String::from_utf8(overflow)
+                .unwrap()
+                .contains("ERR timeout is out of range")
         );
     }
 }

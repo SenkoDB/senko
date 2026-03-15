@@ -236,7 +236,7 @@ fn handle_reset(
         response: simple_string(b"RESET"),
         close_after_write: false,
         suppress_response: false,
-        force_send_response: false,
+        force_send_response: true,
     }
 }
 
@@ -269,10 +269,17 @@ fn handle_auth(
     meta: &mut ConnectionMeta,
 ) -> Result<Vec<u8>, Vec<u8>> {
     let (username, password) = match args {
-        [password] => (
-            b"default".as_slice(),
-            frame_bytes(password).map_err(|error| error_bytes(&error))?,
-        ),
+        [password] => {
+            if acl::default_user_starts_without_password() {
+                return Err(error_message(
+                    "ERR AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?",
+                ));
+            }
+            (
+                b"default".as_slice(),
+                frame_bytes(password).map_err(|error| error_bytes(&error))?,
+            )
+        }
         [username, password] => (
             frame_bytes(username).map_err(|error| error_bytes(&error))?,
             frame_bytes(password).map_err(|error| error_bytes(&error))?,

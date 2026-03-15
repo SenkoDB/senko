@@ -450,6 +450,14 @@ pub fn reset_connection_auth(meta: &mut ConnectionMeta) {
     }
 }
 
+pub fn default_user_starts_without_password() -> bool {
+    let snapshot = current_state();
+    snapshot
+        .users
+        .get("default")
+        .is_some_and(|user| user.enabled && user.nopass)
+}
+
 pub fn authenticate(
     meta: &mut ConnectionMeta,
     username: &[u8],

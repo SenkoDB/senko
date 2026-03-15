@@ -53,8 +53,10 @@ fn array_optional_strings(value: Value) -> Vec<Option<String>> {
 
 fn assert_err_contains<T: std::fmt::Debug>(result: RedisResult<T>, needle: &str) {
     let err = result.unwrap_err();
+    let rendered = err.to_string();
+    let normalized = needle.strip_prefix("ERR ").unwrap_or(needle);
     assert!(
-        err.to_string().contains(needle),
+        rendered.contains(needle) || rendered.contains(normalized),
         "expected error containing {needle:?}, got {err}"
     );
 }
@@ -1489,7 +1491,28 @@ fn generic_error_cases_and_wait_compat() {
             .unwrap(),
         0
     );
-    assert!(start.elapsed() < Duration::from_millis(100));
+    assert!(start.elapsed() >= Duration::from_millis(900));
+    assert_err_contains(
+        redis::cmd("WAIT")
+            .arg(1)
+            .arg("-1")
+            .query::<Value>(&mut conn),
+        "timeout is negative",
+    );
+    assert_err_contains(
+        redis::cmd("WAIT")
+            .arg(1)
+            .arg("9223372036854775808")
+            .query::<Value>(&mut conn),
+        "timeout is not an integer or out of range",
+    );
+    assert_err_contains(
+        redis::cmd("WAIT")
+            .arg(1)
+            .arg("9223372036854775807")
+            .query::<Value>(&mut conn),
+        "timeout is out of range",
+    );
     let waitaof: Vec<i64> = redis::cmd("WAITAOF")
         .arg(1)
         .arg(1)

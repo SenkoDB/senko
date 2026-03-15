@@ -15,6 +15,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use ahash::RandomState;
 use bytes::{Bytes, BytesMut};
 use compact_str::CompactString;
 use compio::{
@@ -25,6 +26,7 @@ use compio::{
 };
 use futures_util::future::poll_fn;
 use futures_util::{FutureExt, pin_mut};
+use hashbrown::{HashMap, HashSet};
 use senko_core::{SenkoConfig, SenkoError, SenkoResult, SenkoValue, ShardExtensions};
 use senko_proto::{AggregateKind, Frame, ParseStatus, RespParser, RespSerializer};
 use senko_scripting::{
@@ -35,16 +37,19 @@ use senko_store::{
     Response, Store,
     commands::generic::keys as generic_keys,
     commands::list::blocking::{
-        BlockSpec, BlockingCommandResult, blmove, blmpop, blpop, brpop, brpoplpush,
+        BlockSpec, BlockingCommandResult, BlockingOp as StoreBlockingOp, BlockingResponseKind,
+        Direction as BlockSpecDirection, blmove, blmpop, blpop, brpop, brpoplpush,
     },
     commands::stream::read::{
         BlockingCommandResult as StreamBlockingCommandResult,
-        GroupBlockingCommandResult as StreamGroupBlockingCommandResult, xread, xreadgroup,
+        GroupBlockingCommandResult as StreamGroupBlockingCommandResult, XReadBlockSpec,
+        XReadGroupBlockSpec, xread, xreadgroup,
     },
     commands::zset::blocking::{
-        BlockSpec as ZBlockSpec, BlockingCommandResult as ZBlockingCommandResult, bzmpop, bzpopmax,
-        bzpopmin,
+        BlockSpec as ZBlockSpec, BlockingCommandResult as ZBlockingCommandResult,
+        BlockingOp as StoreZBlockingOp, bzmpop, bzpopmax, bzpopmin,
     },
+    commands::zset::pop::ZPopDir as ZBlockSpecDirection,
 };
 use tracing::debug;
 
@@ -1163,10 +1168,19 @@ async fn execute_immediate_command(
             .map_err(ConnectionControl::Continue);
     }
 
+    if let Some(result) =
+        dispatch_routed_store_command(meta, command, args, shard_id, config, tracking_registry)
+            .await
+    {
+        return result;
+    }
+
     if let Some(blocked_response) = dispatch_blocking_command(
         meta.id,
         command,
         args,
+        config,
+        shard_id,
         store,
         blocked,
         watch_registry,
@@ -1204,8 +1218,10 @@ async fn execute_immediate_command(
         blocked,
         watch_registry,
         connections,
-        meta,
-    )? {
+        meta.resp_version == 3,
+    )
+    .map_err(ConnectionControl::Continue)?
+    {
         if should_replicate_command(command) {
             server_replication::record_write(shard_id, meta, command, args);
         }
@@ -1280,6 +1296,2413 @@ async fn execute_immediate_command(
         }
         Err(error) => Err(ConnectionControl::Continue(error_bytes(&error))),
     }
+}
+
+async fn dispatch_routed_store_command(
+    meta: &mut ConnectionMeta,
+    command: &[u8],
+    args: &[Frame<'_>],
+    shard_id: usize,
+    config: &SenkoConfig,
+    tracking_registry: &Rc<RefCell<TrackingRegistry>>,
+) -> Option<Result<(Vec<u8>, bool, bool, bool), ConnectionControl>> {
+    if config.num_shards <= 1 {
+        return None;
+    }
+
+    if let Some(result) = dispatch_global_or_special_multi_shard_command(
+        meta,
+        command,
+        args,
+        config,
+        tracking_registry,
+    )
+    .await
+    {
+        return Some(result);
+    }
+
+    if is_local_only_store_command(command) {
+        return None;
+    }
+
+    let keys = match command_info::extract_command_keys(command, args) {
+        Ok(Some(keys)) if !keys.is_empty() => keys,
+        Ok(_) => return None,
+        Err(error) => return Some(Err(ConnectionControl::Continue(error))),
+    };
+
+    let Some(target_shard) = target_shard_for_keys(&keys, config.num_shards) else {
+        if let Some(result) =
+            dispatch_cross_shard_multi_key_command(meta, command, args, config, tracking_registry)
+                .await
+        {
+            return Some(result);
+        }
+        return Some(Err(ConnectionControl::Continue(error_message(
+            "ERR cross-shard multi-key routing not yet supported",
+        ))));
+    };
+
+    if target_shard == shard_id {
+        return None;
+    }
+
+    let routed_args = match args
+        .iter()
+        .map(|arg| {
+            frame_bytes(arg)
+                .map(Bytes::copy_from_slice)
+                .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))
+        })
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(args) => args,
+        Err(error) => return Some(Err(error)),
+    };
+
+    let reply = match server_info::execute_store_command_on_shard(
+        target_shard,
+        Bytes::copy_from_slice(command),
+        routed_args,
+        meta.resp_version == 3,
+        meta.no_touch,
+        meta.id,
+    )
+    .await
+    {
+        Ok(reply) => reply,
+        Err(error) => return Some(Err(ConnectionControl::Continue(error))),
+    };
+
+    if command_info::is_write_command(command) {
+        if let Some(offset) = reply.replication_offset {
+            meta.last_write_replication_offset = offset;
+        }
+    } else {
+        client_ops::maybe_track_read(command, args, meta, tracking_registry);
+    }
+
+    Some(Ok((reply.response, false, false, false)))
+}
+
+async fn dispatch_cross_shard_multi_key_command(
+    meta: &mut ConnectionMeta,
+    command: &[u8],
+    args: &[Frame<'_>],
+    config: &SenkoConfig,
+    tracking_registry: &Rc<RefCell<TrackingRegistry>>,
+) -> Option<Result<(Vec<u8>, bool, bool, bool), ConnectionControl>> {
+    if eq_ascii(command, b"MGET") {
+        return Some(dispatch_cross_shard_mget(meta, args, config, tracking_registry).await);
+    }
+    if eq_ascii(command, b"MSET") {
+        return Some(dispatch_cross_shard_mset(meta, args, config, tracking_registry).await);
+    }
+    if eq_ascii(command, b"MSETNX") {
+        return Some(dispatch_cross_shard_msetnx(meta, args, config).await);
+    }
+    if eq_ascii(command, b"MSETEX") {
+        return Some(dispatch_cross_shard_msetex(meta, args, config).await);
+    }
+    if eq_ascii(command, b"BITOP") {
+        let source_keys = match collect_bitop_source_keys(args) {
+            Ok(keys) => keys,
+            Err(error) => return Some(Err(error)),
+        };
+        let destination = match parse_required_arg_bytes(
+            args,
+            1,
+            "ERR wrong number of arguments for 'bitop' command",
+        ) {
+            Ok(value) => value,
+            Err(error) => return Some(Err(error)),
+        };
+        return Some(
+            dispatch_cross_shard_temp_store_command(
+                meta,
+                command,
+                args,
+                config,
+                source_keys,
+                Some(destination),
+                tracking_registry,
+            )
+            .await,
+        );
+    }
+    if eq_ascii(command, b"LCS") {
+        let source_keys = match collect_fixed_arg_keys(args, &[0, 1]) {
+            Ok(keys) => keys,
+            Err(error) => return Some(Err(error)),
+        };
+        return Some(
+            dispatch_cross_shard_temp_store_command(
+                meta,
+                command,
+                args,
+                config,
+                source_keys,
+                None,
+                tracking_registry,
+            )
+            .await,
+        );
+    }
+    if eq_ascii(command, b"PFCOUNT") {
+        let source_keys = match collect_all_arg_keys(args) {
+            Ok(keys) => keys,
+            Err(error) => return Some(Err(error)),
+        };
+        return Some(
+            dispatch_cross_shard_temp_store_command(
+                meta,
+                command,
+                args,
+                config,
+                source_keys,
+                None,
+                tracking_registry,
+            )
+            .await,
+        );
+    }
+    if eq_ascii(command, b"PFMERGE") {
+        let source_keys = match collect_all_arg_keys(args) {
+            Ok(keys) => keys,
+            Err(error) => return Some(Err(error)),
+        };
+        let destination = match parse_required_arg_bytes(
+            args,
+            0,
+            "ERR wrong number of arguments for 'pfmerge' command",
+        ) {
+            Ok(value) => value,
+            Err(error) => return Some(Err(error)),
+        };
+        return Some(
+            dispatch_cross_shard_temp_store_command(
+                meta,
+                command,
+                args,
+                config,
+                source_keys,
+                Some(destination),
+                tracking_registry,
+            )
+            .await,
+        );
+    }
+    if eq_ascii(command, b"COPY") {
+        return Some(dispatch_cross_shard_copy(meta, args, config).await);
+    }
+    if eq_ascii(command, b"RENAME") {
+        return Some(dispatch_cross_shard_rename(meta, args, config, false).await);
+    }
+    if eq_ascii(command, b"RENAMENX") {
+        return Some(dispatch_cross_shard_rename(meta, args, config, true).await);
+    }
+    if eq_ascii(command, b"LMOVE") || eq_ascii(command, b"RPOPLPUSH") {
+        return Some(dispatch_cross_shard_list_move(meta, command, args, config).await);
+    }
+    if eq_ascii(command, b"SMOVE") {
+        return Some(dispatch_cross_shard_smove(meta, args, config).await);
+    }
+    if eq_ascii(command, b"LMPOP") {
+        return Some(dispatch_cross_shard_lmpop(meta, args, config).await);
+    }
+    if eq_ascii(command, b"ZMPOP") {
+        return Some(dispatch_cross_shard_zmpop(meta, args, config).await);
+    }
+    if eq_ascii(command, b"SDIFF")
+        || eq_ascii(command, b"SINTER")
+        || eq_ascii(command, b"SINTERCARD")
+        || eq_ascii(command, b"SUNION")
+        || eq_ascii(command, b"SDIFFSTORE")
+        || eq_ascii(command, b"SINTERSTORE")
+        || eq_ascii(command, b"SUNIONSTORE")
+    {
+        return Some(dispatch_cross_shard_set_algebra(meta, command, args, config).await);
+    }
+    if eq_ascii(command, b"ZDIFF")
+        || eq_ascii(command, b"ZINTER")
+        || eq_ascii(command, b"ZINTERCARD")
+        || eq_ascii(command, b"ZUNION")
+        || eq_ascii(command, b"ZDIFFSTORE")
+        || eq_ascii(command, b"ZINTERSTORE")
+        || eq_ascii(command, b"ZUNIONSTORE")
+        || eq_ascii(command, b"ZRANGESTORE")
+    {
+        return Some(
+            dispatch_cross_shard_zset_temp_command(meta, command, args, config, tracking_registry)
+                .await,
+        );
+    }
+    if eq_ascii(command, b"DEL")
+        || eq_ascii(command, b"UNLINK")
+        || eq_ascii(command, b"EXISTS")
+        || eq_ascii(command, b"TOUCH")
+    {
+        return Some(dispatch_cross_shard_integer_sum(meta, command, args, config).await);
+    }
+    None
+}
+
+async fn dispatch_cross_shard_mget(
+    meta: &mut ConnectionMeta,
+    args: &[Frame<'_>],
+    config: &SenkoConfig,
+    tracking_registry: &Rc<RefCell<TrackingRegistry>>,
+) -> Result<(Vec<u8>, bool, bool, bool), ConnectionControl> {
+    let grouped = match group_key_args(args, config.num_shards) {
+        Ok(grouped) => grouped,
+        Err(error) => return Err(ConnectionControl::Continue(error)),
+    };
+    let mut merged = vec![Response::Value(None); args.len()];
+    for (shard_id, entries) in grouped {
+        let shard_args = entries
+            .iter()
+            .map(|(_, bytes)| Bytes::copy_from_slice(bytes.as_slice()))
+            .collect::<Vec<_>>();
+        let reply = server_info::execute_store_command_on_shard(
+            shard_id,
+            Bytes::copy_from_slice(b"MGET"),
+            shard_args,
+            meta.resp_version == 3,
+            meta.no_touch,
+            meta.id,
+        )
+        .await
+        .map_err(ConnectionControl::Continue)?;
+        let values = parse_mget_response(&reply.response).map_err(ConnectionControl::Continue)?;
+        if values.len() != entries.len() {
+            return Err(ConnectionControl::Continue(error_message(
+                "ERR shard coordination protocol error",
+            )));
+        }
+        for ((index, _), value) in entries.into_iter().zip(values.into_iter()) {
+            merged[index] = value;
+        }
+    }
+    client_ops::maybe_track_read(b"MGET", args, meta, tracking_registry);
+    Ok((
+        serialize_response(
+            &Response::Array(Box::new(
+                merged
+                    .into_iter()
+                    .collect::<smallvec::SmallVec<[Response; 16]>>(),
+            )),
+            meta.resp_version == 3,
+        ),
+        false,
+        false,
+        false,
+    ))
+}
+
+async fn dispatch_cross_shard_mset(
+    meta: &mut ConnectionMeta,
+    args: &[Frame<'_>],
+    config: &SenkoConfig,
+    _tracking_registry: &Rc<RefCell<TrackingRegistry>>,
+) -> Result<(Vec<u8>, bool, bool, bool), ConnectionControl> {
+    let grouped = match group_mset_pairs(args, config.num_shards) {
+        Ok(grouped) => grouped,
+        Err(error) => return Err(ConnectionControl::Continue(error)),
+    };
+    let mut max_offset = None;
+    for (shard_id, shard_args) in grouped {
+        let reply = server_info::execute_store_command_on_shard(
+            shard_id,
+            Bytes::copy_from_slice(b"MSET"),
+            shard_args,
+            meta.resp_version == 3,
+            meta.no_touch,
+            meta.id,
+        )
+        .await
+        .map_err(ConnectionControl::Continue)?;
+        if !parse_ok_response(&reply.response).map_err(ConnectionControl::Continue)? {
+            return Err(ConnectionControl::Continue(error_message(
+                "ERR shard coordination protocol error",
+            )));
+        }
+        max_offset = max_offset.max(reply.replication_offset);
+    }
+    if let Some(offset) = max_offset {
+        meta.last_write_replication_offset = offset;
+    }
+    Ok((
+        serialize_response(&Response::Simple(b"OK"), meta.resp_version == 3),
+        false,
+        false,
+        false,
+    ))
+}
+
+async fn dispatch_cross_shard_integer_sum(
+    meta: &mut ConnectionMeta,
+    command: &[u8],
+    args: &[Frame<'_>],
+    config: &SenkoConfig,
+) -> Result<(Vec<u8>, bool, bool, bool), ConnectionControl> {
+    let grouped = match group_key_args(args, config.num_shards) {
+        Ok(grouped) => grouped,
+        Err(error) => return Err(ConnectionControl::Continue(error)),
+    };
+    let mut total = 0i64;
+    let mut max_offset = None;
+    for (shard_id, entries) in grouped {
+        let shard_args = entries
+            .iter()
+            .map(|(_, bytes)| Bytes::copy_from_slice(bytes.as_slice()))
+            .collect::<Vec<_>>();
+        let reply = server_info::execute_store_command_on_shard(
+            shard_id,
+            Bytes::copy_from_slice(command),
+            shard_args,
+            meta.resp_version == 3,
+            meta.no_touch,
+            meta.id,
+        )
+        .await
+        .map_err(ConnectionControl::Continue)?;
+        total += parse_integer_response(&reply.response).map_err(ConnectionControl::Continue)?;
+        max_offset = max_offset.max(reply.replication_offset);
+    }
+    if command_info::is_write_command(command)
+        && let Some(offset) = max_offset
+    {
+        meta.last_write_replication_offset = offset;
+    }
+    Ok((
+        serialize_response(&Response::Integer(total), meta.resp_version == 3),
+        false,
+        false,
+        false,
+    ))
+}
+
+async fn dispatch_cross_shard_msetnx(
+    meta: &mut ConnectionMeta,
+    args: &[Frame<'_>],
+    config: &SenkoConfig,
+) -> Result<(Vec<u8>, bool, bool, bool), ConnectionControl> {
+    if cross_shard_exists_count(args, config.num_shards, meta).await? > 0 {
+        return Ok((
+            serialize_response(&Response::Integer(0), meta.resp_version == 3),
+            false,
+            false,
+            false,
+        ));
+    }
+    let grouped = match group_mset_pairs(args, config.num_shards) {
+        Ok(grouped) => grouped,
+        Err(error) => return Err(ConnectionControl::Continue(error)),
+    };
+    let mut max_offset = None;
+    for (shard_id, shard_args) in grouped {
+        let reply = server_info::execute_store_command_on_shard(
+            shard_id,
+            Bytes::copy_from_slice(b"MSET"),
+            shard_args,
+            meta.resp_version == 3,
+            meta.no_touch,
+            meta.id,
+        )
+        .await
+        .map_err(ConnectionControl::Continue)?;
+        if !parse_ok_response(&reply.response).map_err(ConnectionControl::Continue)? {
+            return Err(ConnectionControl::Continue(error_message(
+                "ERR shard coordination protocol error",
+            )));
+        }
+        max_offset = max_offset.max(reply.replication_offset);
+    }
+    if let Some(offset) = max_offset {
+        meta.last_write_replication_offset = offset;
+    }
+    Ok((
+        serialize_response(&Response::Integer(1), meta.resp_version == 3),
+        false,
+        false,
+        false,
+    ))
+}
+
+async fn dispatch_cross_shard_msetex(
+    meta: &mut ConnectionMeta,
+    args: &[Frame<'_>],
+    config: &SenkoConfig,
+) -> Result<(Vec<u8>, bool, bool, bool), ConnectionControl> {
+    let parsed = parse_cross_shard_msetex_args(args).map_err(ConnectionControl::Continue)?;
+    let key_args = parsed
+        .pair_bytes
+        .chunks(2)
+        .filter_map(|chunk| chunk.first())
+        .map(|key| Frame::BulkString(key.as_ref()))
+        .collect::<Vec<_>>();
+    let present = cross_shard_exists_count(&key_args, config.num_shards, meta).await?;
+    match parsed.condition {
+        CrossShardBatchCondition::Nx if present > 0 => {
+            return Ok((
+                serialize_response(&Response::Integer(0), meta.resp_version == 3),
+                false,
+                false,
+                false,
+            ));
+        }
+        CrossShardBatchCondition::Xx if present != parsed.numkeys as i64 => {
+            return Ok((
+                serialize_response(&Response::Integer(0), meta.resp_version == 3),
+                false,
+                false,
+                false,
+            ));
+        }
+        _ => {}
+    }
+
+    let grouped = group_msetex_pairs(&parsed, config.num_shards);
+    let mut max_offset = None;
+    for (shard_id, shard_args) in grouped {
+        let reply = server_info::execute_store_command_on_shard(
+            shard_id,
+            Bytes::copy_from_slice(b"MSETEX"),
+            shard_args,
+            meta.resp_version == 3,
+            meta.no_touch,
+            meta.id,
+        )
+        .await
+        .map_err(ConnectionControl::Continue)?;
+        let applied =
+            parse_integer_response(&reply.response).map_err(ConnectionControl::Continue)?;
+        if applied <= 0 {
+            return Err(ConnectionControl::Continue(error_message(
+                "ERR shard coordination protocol error",
+            )));
+        }
+        max_offset = max_offset.max(reply.replication_offset);
+    }
+    if let Some(offset) = max_offset {
+        meta.last_write_replication_offset = offset;
+    }
+    Ok((
+        serialize_response(
+            &Response::Integer(parsed.numkeys as i64),
+            meta.resp_version == 3,
+        ),
+        false,
+        false,
+        false,
+    ))
+}
+
+async fn dispatch_global_or_special_multi_shard_command(
+    meta: &mut ConnectionMeta,
+    command: &[u8],
+    args: &[Frame<'_>],
+    config: &SenkoConfig,
+    tracking_registry: &Rc<RefCell<TrackingRegistry>>,
+) -> Option<Result<(Vec<u8>, bool, bool, bool), ConnectionControl>> {
+    if eq_ascii(command, b"KEYS") {
+        return Some(dispatch_global_keys(meta, args, config).await);
+    }
+    if eq_ascii(command, b"SCAN") {
+        return Some(dispatch_global_scan(meta, args, config).await);
+    }
+    if eq_ascii(command, b"RANDOMKEY") {
+        return Some(dispatch_global_randomkey(meta, args, config).await);
+    }
+    if eq_ascii(command, b"SORT") || eq_ascii(command, b"SORT_RO") {
+        return Some(
+            dispatch_global_sort_command(meta, command, args, config, tracking_registry).await,
+        );
+    }
+    if eq_ascii(command, b"GEOSEARCHSTORE") {
+        let source_keys = match collect_fixed_arg_keys(args, &[1]) {
+            Ok(keys) => keys,
+            Err(error) => return Some(Err(error)),
+        };
+        let destination = match parse_required_arg_bytes(
+            args,
+            0,
+            "ERR wrong number of arguments for 'geosearchstore' command",
+        ) {
+            Ok(value) => value,
+            Err(error) => return Some(Err(error)),
+        };
+        return Some(
+            dispatch_cross_shard_temp_store_command(
+                meta,
+                command,
+                args,
+                config,
+                source_keys,
+                Some(destination),
+                tracking_registry,
+            )
+            .await,
+        );
+    }
+    if (eq_ascii(command, b"GEORADIUS") || eq_ascii(command, b"GEORADIUSBYMEMBER"))
+        && has_geo_store_option(args)
+    {
+        let source_keys = match collect_fixed_arg_keys(args, &[0]) {
+            Ok(keys) => keys,
+            Err(error) => return Some(Err(error)),
+        };
+        let destination = match find_option_destination(args, &[b"STORE", b"STOREDIST"]) {
+            Ok(destination) => destination,
+            Err(error) => return Some(Err(error)),
+        };
+        return Some(
+            dispatch_cross_shard_temp_store_command(
+                meta,
+                command,
+                args,
+                config,
+                source_keys,
+                destination,
+                tracking_registry,
+            )
+            .await,
+        );
+    }
+    None
+}
+
+async fn dispatch_cross_shard_temp_store_command(
+    meta: &mut ConnectionMeta,
+    command: &[u8],
+    args: &[Frame<'_>],
+    config: &SenkoConfig,
+    source_keys: Vec<Bytes>,
+    destination: Option<Bytes>,
+    tracking_registry: &Rc<RefCell<TrackingRegistry>>,
+) -> Result<(Vec<u8>, bool, bool, bool), ConnectionControl> {
+    let owned_args = collect_frame_args(args)?;
+    let mut temp_store = hydrate_temp_store_from_keys(&source_keys, config, meta).await?;
+    let frames = bytes_to_frames(&owned_args);
+    let response = dispatch::dispatch(&mut temp_store, command, &frames)
+        .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
+
+    let mut max_offset = None;
+    if let Some(destination) = destination {
+        max_offset = sync_temp_store_key(&mut temp_store, &destination, config, meta).await?;
+    } else if !command_info::is_write_command(command) {
+        client_ops::maybe_track_read(command, args, meta, tracking_registry);
+    }
+    if let Some(offset) = max_offset {
+        meta.last_write_replication_offset = offset;
+    }
+    Ok((
+        serialize_response(&response, meta.resp_version == 3),
+        false,
+        false,
+        false,
+    ))
+}
+
+async fn dispatch_cross_shard_lmpop(
+    meta: &mut ConnectionMeta,
+    args: &[Frame<'_>],
+    config: &SenkoConfig,
+) -> Result<(Vec<u8>, bool, bool, bool), ConnectionControl> {
+    if args.len() < 3 {
+        return Err(ConnectionControl::Continue(error_message(
+            "ERR wrong number of arguments for 'lmpop' command",
+        )));
+    }
+    let numkeys = parse_numkeys_arg(
+        args,
+        0,
+        "ERR numkeys should be greater than 0",
+        "ERR numkeys does not match number of keys",
+    )?;
+    let side_index = 1 + numkeys;
+    let side = parse_required_arg_bytes(
+        args,
+        side_index,
+        "ERR wrong number of arguments for 'lmpop' command",
+    )?;
+    let mut pop_args = vec![side.clone()];
+    if side_index + 1 < args.len() {
+        pop_args.extend(collect_frame_args(&args[side_index + 1..])?);
+    }
+    for index in 1..=numkeys {
+        let key =
+            parse_required_arg_bytes(args, index, "ERR numkeys does not match number of keys")?;
+        let shard_id = shard_for_key(key.as_ref(), config.num_shards);
+        let mut shard_args = vec![Bytes::from_static(b"1"), key.clone()];
+        shard_args.extend(pop_args.iter().cloned());
+        let reply = server_info::execute_store_command_on_shard(
+            shard_id,
+            Bytes::copy_from_slice(b"LMPOP"),
+            shard_args,
+            meta.resp_version == 3,
+            meta.no_touch,
+            meta.id,
+        )
+        .await
+        .map_err(ConnectionControl::Continue)?;
+        if !is_null_response(&reply.response).map_err(ConnectionControl::Continue)? {
+            if let Some(offset) = reply.replication_offset {
+                meta.last_write_replication_offset = offset;
+            }
+            return Ok((reply.response, false, false, false));
+        }
+    }
+    Ok((
+        serialize_response(&Response::Value(None), meta.resp_version == 3),
+        false,
+        false,
+        false,
+    ))
+}
+
+async fn dispatch_cross_shard_zmpop(
+    meta: &mut ConnectionMeta,
+    args: &[Frame<'_>],
+    config: &SenkoConfig,
+) -> Result<(Vec<u8>, bool, bool, bool), ConnectionControl> {
+    if args.len() < 3 {
+        return Err(ConnectionControl::Continue(error_message(
+            "ERR wrong number of arguments for 'zmpop' command",
+        )));
+    }
+    let numkeys = parse_numkeys_arg(
+        args,
+        0,
+        "ERR numkeys should be greater than 0",
+        "ERR numkeys does not match number of keys",
+    )?;
+    let side_index = 1 + numkeys;
+    let side = parse_required_arg_bytes(
+        args,
+        side_index,
+        "ERR wrong number of arguments for 'zmpop' command",
+    )?;
+    let mut pop_args = vec![side.clone()];
+    if side_index + 1 < args.len() {
+        pop_args.extend(collect_frame_args(&args[side_index + 1..])?);
+    }
+    for index in 1..=numkeys {
+        let key =
+            parse_required_arg_bytes(args, index, "ERR numkeys does not match number of keys")?;
+        let shard_id = shard_for_key(key.as_ref(), config.num_shards);
+        let mut shard_args = vec![Bytes::from_static(b"1"), key.clone()];
+        shard_args.extend(pop_args.iter().cloned());
+        let reply = server_info::execute_store_command_on_shard(
+            shard_id,
+            Bytes::copy_from_slice(b"ZMPOP"),
+            shard_args,
+            meta.resp_version == 3,
+            meta.no_touch,
+            meta.id,
+        )
+        .await
+        .map_err(ConnectionControl::Continue)?;
+        if !is_null_response(&reply.response).map_err(ConnectionControl::Continue)? {
+            if let Some(offset) = reply.replication_offset {
+                meta.last_write_replication_offset = offset;
+            }
+            return Ok((reply.response, false, false, false));
+        }
+    }
+    Ok((
+        serialize_response(&Response::Value(None), meta.resp_version == 3),
+        false,
+        false,
+        false,
+    ))
+}
+
+async fn dispatch_cross_shard_zset_temp_command(
+    meta: &mut ConnectionMeta,
+    command: &[u8],
+    args: &[Frame<'_>],
+    config: &SenkoConfig,
+    tracking_registry: &Rc<RefCell<TrackingRegistry>>,
+) -> Result<(Vec<u8>, bool, bool, bool), ConnectionControl> {
+    let (source_keys, destination) = collect_zset_temp_command_keys(command, args)?;
+    dispatch_cross_shard_temp_store_command(
+        meta,
+        command,
+        args,
+        config,
+        source_keys,
+        destination,
+        tracking_registry,
+    )
+    .await
+}
+
+async fn dispatch_cross_shard_copy(
+    meta: &mut ConnectionMeta,
+    args: &[Frame<'_>],
+    config: &SenkoConfig,
+) -> Result<(Vec<u8>, bool, bool, bool), ConnectionControl> {
+    let (source, destination, replace) = parse_cross_shard_copy_args(args)?;
+    let source_shard = shard_for_key(source.as_ref(), config.num_shards);
+    let destination_shard = shard_for_key(destination.as_ref(), config.num_shards);
+    let Some((payload, ttl_ms)) = fetch_dump_payload(&source, source_shard, meta).await? else {
+        return Ok((
+            serialize_response(&Response::Integer(0), meta.resp_version == 3),
+            false,
+            false,
+            false,
+        ));
+    };
+    if !replace {
+        let exists_reply = server_info::execute_store_command_on_shard(
+            destination_shard,
+            Bytes::copy_from_slice(b"EXISTS"),
+            vec![destination.clone()],
+            meta.resp_version == 3,
+            meta.no_touch,
+            meta.id,
+        )
+        .await
+        .map_err(ConnectionControl::Continue)?;
+        if parse_integer_response(&exists_reply.response).map_err(ConnectionControl::Continue)? > 0
+        {
+            return Ok((
+                serialize_response(&Response::Integer(0), meta.resp_version == 3),
+                false,
+                false,
+                false,
+            ));
+        }
+    }
+    let restore_reply = server_info::execute_store_command_on_shard(
+        destination_shard,
+        Bytes::copy_from_slice(b"RESTORE"),
+        restore_args(&destination, ttl_ms, &payload, replace),
+        meta.resp_version == 3,
+        meta.no_touch,
+        meta.id,
+    )
+    .await
+    .map_err(ConnectionControl::Continue)?;
+    if !parse_ok_response(&restore_reply.response).map_err(ConnectionControl::Continue)? {
+        return Err(ConnectionControl::Continue(error_message(
+            "ERR shard coordination protocol error",
+        )));
+    }
+    if let Some(offset) = restore_reply.replication_offset {
+        meta.last_write_replication_offset = offset;
+    }
+    Ok((
+        serialize_response(&Response::Integer(1), meta.resp_version == 3),
+        false,
+        false,
+        false,
+    ))
+}
+
+async fn dispatch_cross_shard_rename(
+    meta: &mut ConnectionMeta,
+    args: &[Frame<'_>],
+    config: &SenkoConfig,
+    nx: bool,
+) -> Result<(Vec<u8>, bool, bool, bool), ConnectionControl> {
+    let (source, destination) = parse_cross_shard_two_keys(
+        args,
+        if nx {
+            "ERR wrong number of arguments for 'renamenx' command"
+        } else {
+            "ERR wrong number of arguments for 'rename' command"
+        },
+        true,
+    )?;
+    let source_shard = shard_for_key(source.as_ref(), config.num_shards);
+    let destination_shard = shard_for_key(destination.as_ref(), config.num_shards);
+    let Some((payload, ttl_ms)) = fetch_dump_payload(&source, source_shard, meta).await? else {
+        return Err(ConnectionControl::Continue(error_message(
+            "ERR no such key",
+        )));
+    };
+
+    if nx {
+        let exists_reply = server_info::execute_store_command_on_shard(
+            destination_shard,
+            Bytes::copy_from_slice(b"EXISTS"),
+            vec![destination.clone()],
+            meta.resp_version == 3,
+            meta.no_touch,
+            meta.id,
+        )
+        .await
+        .map_err(ConnectionControl::Continue)?;
+        if parse_integer_response(&exists_reply.response).map_err(ConnectionControl::Continue)? > 0
+        {
+            return Ok((
+                serialize_response(&Response::Integer(0), meta.resp_version == 3),
+                false,
+                false,
+                false,
+            ));
+        }
+    }
+
+    let restore_reply = server_info::execute_store_command_on_shard(
+        destination_shard,
+        Bytes::copy_from_slice(b"RESTORE"),
+        restore_args(&destination, ttl_ms, &payload, !nx),
+        meta.resp_version == 3,
+        meta.no_touch,
+        meta.id,
+    )
+    .await
+    .map_err(ConnectionControl::Continue)?;
+    if !parse_ok_response(&restore_reply.response).map_err(ConnectionControl::Continue)? {
+        return Err(ConnectionControl::Continue(error_message(
+            "ERR shard coordination protocol error",
+        )));
+    }
+    let delete_reply = server_info::execute_store_command_on_shard(
+        source_shard,
+        Bytes::copy_from_slice(b"DEL"),
+        vec![source.clone()],
+        meta.resp_version == 3,
+        meta.no_touch,
+        meta.id,
+    )
+    .await
+    .map_err(ConnectionControl::Continue)?;
+    let deleted =
+        parse_integer_response(&delete_reply.response).map_err(ConnectionControl::Continue)?;
+    if deleted != 1 {
+        return Err(ConnectionControl::Continue(error_message(
+            "ERR shard coordination protocol error",
+        )));
+    }
+    if let Some(offset) = restore_reply
+        .replication_offset
+        .max(delete_reply.replication_offset)
+    {
+        meta.last_write_replication_offset = offset;
+    }
+    Ok((
+        serialize_response(
+            if nx {
+                &Response::Integer(1)
+            } else {
+                &Response::Simple(b"OK")
+            },
+            meta.resp_version == 3,
+        ),
+        false,
+        false,
+        false,
+    ))
+}
+
+async fn dispatch_cross_shard_list_move(
+    meta: &mut ConnectionMeta,
+    command: &[u8],
+    args: &[Frame<'_>],
+    config: &SenkoConfig,
+) -> Result<(Vec<u8>, bool, bool, bool), ConnectionControl> {
+    let (source, destination, pop_command, push_command) =
+        parse_cross_shard_list_move_args(command, args)?;
+    let source_shard = shard_for_key(source.as_ref(), config.num_shards);
+    let destination_shard = shard_for_key(destination.as_ref(), config.num_shards);
+    ensure_remote_type(destination_shard, &destination, b"list", meta).await?;
+    let pop_reply = server_info::execute_store_command_on_shard(
+        source_shard,
+        Bytes::copy_from_slice(pop_command),
+        vec![source.clone()],
+        meta.resp_version == 3,
+        meta.no_touch,
+        meta.id,
+    )
+    .await
+    .map_err(ConnectionControl::Continue)?;
+    let Some(member) =
+        parse_optional_bytes_response(&pop_reply.response).map_err(ConnectionControl::Continue)?
+    else {
+        return Ok((
+            serialize_response(&Response::Value(None), meta.resp_version == 3),
+            false,
+            false,
+            false,
+        ));
+    };
+    let push_reply = server_info::execute_store_command_on_shard(
+        destination_shard,
+        Bytes::copy_from_slice(push_command),
+        vec![destination.clone(), Bytes::from(member.clone())],
+        meta.resp_version == 3,
+        meta.no_touch,
+        meta.id,
+    )
+    .await
+    .map_err(ConnectionControl::Continue)?;
+    let _ = parse_integer_response(&push_reply.response).map_err(ConnectionControl::Continue)?;
+    if let Some(offset) = pop_reply
+        .replication_offset
+        .max(push_reply.replication_offset)
+    {
+        meta.last_write_replication_offset = offset;
+    }
+    Ok((
+        serialize_response(
+            &Response::Value(Some(SenkoValue::Raw(Bytes::from(member)))),
+            meta.resp_version == 3,
+        ),
+        false,
+        false,
+        false,
+    ))
+}
+
+async fn dispatch_cross_shard_smove(
+    meta: &mut ConnectionMeta,
+    args: &[Frame<'_>],
+    config: &SenkoConfig,
+) -> Result<(Vec<u8>, bool, bool, bool), ConnectionControl> {
+    if args.len() != 3 {
+        return Err(ConnectionControl::Continue(error_message(
+            "ERR wrong number of arguments for 'smove' command",
+        )));
+    }
+    let source = frame_bytes(&args[0])
+        .map(Bytes::copy_from_slice)
+        .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
+    let destination = frame_bytes(&args[1])
+        .map(Bytes::copy_from_slice)
+        .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
+    let member = frame_bytes(&args[2])
+        .map(Bytes::copy_from_slice)
+        .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
+    let source_shard = shard_for_key(source.as_ref(), config.num_shards);
+    let destination_shard = shard_for_key(destination.as_ref(), config.num_shards);
+    ensure_remote_type(source_shard, &source, b"set", meta).await?;
+    ensure_remote_type(destination_shard, &destination, b"set", meta).await?;
+    let present_reply = server_info::execute_store_command_on_shard(
+        source_shard,
+        Bytes::copy_from_slice(b"SISMEMBER"),
+        vec![source.clone(), member.clone()],
+        meta.resp_version == 3,
+        meta.no_touch,
+        meta.id,
+    )
+    .await
+    .map_err(ConnectionControl::Continue)?;
+    if parse_integer_response(&present_reply.response).map_err(ConnectionControl::Continue)? == 0 {
+        return Ok((
+            serialize_response(&Response::Integer(0), meta.resp_version == 3),
+            false,
+            false,
+            false,
+        ));
+    }
+    let remove_reply = server_info::execute_store_command_on_shard(
+        source_shard,
+        Bytes::copy_from_slice(b"SREM"),
+        vec![source.clone(), member.clone()],
+        meta.resp_version == 3,
+        meta.no_touch,
+        meta.id,
+    )
+    .await
+    .map_err(ConnectionControl::Continue)?;
+    if parse_integer_response(&remove_reply.response).map_err(ConnectionControl::Continue)? == 0 {
+        return Ok((
+            serialize_response(&Response::Integer(0), meta.resp_version == 3),
+            false,
+            false,
+            false,
+        ));
+    }
+    let add_reply = server_info::execute_store_command_on_shard(
+        destination_shard,
+        Bytes::copy_from_slice(b"SADD"),
+        vec![destination.clone(), member],
+        meta.resp_version == 3,
+        meta.no_touch,
+        meta.id,
+    )
+    .await
+    .map_err(ConnectionControl::Continue)?;
+    let _ = parse_integer_response(&add_reply.response).map_err(ConnectionControl::Continue)?;
+    if let Some(offset) = remove_reply
+        .replication_offset
+        .max(add_reply.replication_offset)
+    {
+        meta.last_write_replication_offset = offset;
+    }
+    Ok((
+        serialize_response(&Response::Integer(1), meta.resp_version == 3),
+        false,
+        false,
+        false,
+    ))
+}
+
+async fn dispatch_cross_shard_set_algebra(
+    meta: &mut ConnectionMeta,
+    command: &[u8],
+    args: &[Frame<'_>],
+    config: &SenkoConfig,
+) -> Result<(Vec<u8>, bool, bool, bool), ConnectionControl> {
+    if eq_ascii(command, b"SDIFF") || eq_ascii(command, b"SINTER") || eq_ascii(command, b"SUNION") {
+        let keys = args
+            .iter()
+            .map(|frame| {
+                frame_bytes(frame)
+                    .map(Bytes::copy_from_slice)
+                    .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let sets = fetch_set_sources(&keys, config.num_shards, meta).await?;
+        let members = if eq_ascii(command, b"SDIFF") {
+            compute_cross_shard_sdiff(&sets)
+        } else if eq_ascii(command, b"SINTER") {
+            compute_cross_shard_sinter(&sets, None)
+        } else {
+            compute_cross_shard_sunion(&sets)
+        };
+        return Ok((
+            serialize_response(&set_members_response(&members), meta.resp_version == 3),
+            false,
+            false,
+            false,
+        ));
+    }
+
+    if eq_ascii(command, b"SINTERCARD") {
+        let (keys, limit) = parse_cross_shard_sintercard_args(args)?;
+        let sets = fetch_set_sources(&keys, config.num_shards, meta).await?;
+        let members = compute_cross_shard_sinter(&sets, limit);
+        return Ok((
+            serialize_response(
+                &Response::Integer(members.len() as i64),
+                meta.resp_version == 3,
+            ),
+            false,
+            false,
+            false,
+        ));
+    }
+
+    let (destination, sources) = parse_cross_shard_set_store_args(command, args)?;
+    let sets = fetch_set_sources(&sources, config.num_shards, meta).await?;
+    let members = if eq_ascii(command, b"SDIFFSTORE") {
+        compute_cross_shard_sdiff(&sets)
+    } else if eq_ascii(command, b"SINTERSTORE") {
+        compute_cross_shard_sinter(&sets, None)
+    } else {
+        compute_cross_shard_sunion(&sets)
+    };
+    let written =
+        write_cross_shard_set_result(destination.as_ref(), &members, config.num_shards, meta)
+            .await?;
+    if let Some(offset) = written {
+        meta.last_write_replication_offset = offset;
+    }
+    Ok((
+        serialize_response(
+            &Response::Integer(members.len() as i64),
+            meta.resp_version == 3,
+        ),
+        false,
+        false,
+        false,
+    ))
+}
+
+async fn dispatch_global_keys(
+    meta: &mut ConnectionMeta,
+    args: &[Frame<'_>],
+    config: &SenkoConfig,
+) -> Result<(Vec<u8>, bool, bool, bool), ConnectionControl> {
+    let pattern =
+        parse_required_arg_bytes(args, 0, "ERR wrong number of arguments for 'keys' command")?;
+    if args.len() != 1 {
+        return Err(ConnectionControl::Continue(error_message(
+            "ERR wrong number of arguments for 'keys' command",
+        )));
+    }
+    let keys = fetch_all_keys_matching(pattern.as_ref(), meta, config.num_shards).await?;
+    Ok((
+        serialize_response(&key_array_response(&keys), meta.resp_version == 3),
+        false,
+        false,
+        false,
+    ))
+}
+
+async fn dispatch_global_randomkey(
+    meta: &mut ConnectionMeta,
+    args: &[Frame<'_>],
+    config: &SenkoConfig,
+) -> Result<(Vec<u8>, bool, bool, bool), ConnectionControl> {
+    if !args.is_empty() {
+        return Err(ConnectionControl::Continue(error_message(
+            "ERR wrong number of arguments for 'randomkey' command",
+        )));
+    }
+    let keys = fetch_all_keys_matching(b"*", meta, config.num_shards).await?;
+    let Some(key) = keys.get(random_index(keys.len())) else {
+        return Ok((
+            serialize_response(&Response::Value(None), meta.resp_version == 3),
+            false,
+            false,
+            false,
+        ));
+    };
+    if !meta.no_touch {
+        let _ = server_info::execute_store_command_on_shard(
+            shard_for_key(key.as_ref(), config.num_shards),
+            Bytes::copy_from_slice(b"TOUCH"),
+            vec![key.clone()],
+            meta.resp_version == 3,
+            false,
+            meta.id,
+        )
+        .await
+        .map_err(ConnectionControl::Continue)?;
+    }
+    Ok((
+        serialize_response(
+            &Response::Value(Some(SenkoValue::Raw(key.clone()))),
+            meta.resp_version == 3,
+        ),
+        false,
+        false,
+        false,
+    ))
+}
+
+async fn dispatch_global_scan(
+    meta: &mut ConnectionMeta,
+    args: &[Frame<'_>],
+    config: &SenkoConfig,
+) -> Result<(Vec<u8>, bool, bool, bool), ConnectionControl> {
+    let (cursor, pattern, count, type_filter, type_filter_valid) = parse_global_scan_args(args)?;
+    if !type_filter_valid {
+        return Ok((
+            serialize_response(&scan_response(0, &[]), meta.resp_version == 3),
+            false,
+            false,
+            false,
+        ));
+    }
+    let mut keys =
+        fetch_all_keys_matching(pattern.as_deref().unwrap_or(b"*"), meta, config.num_shards)
+            .await?;
+    if let Some(filter) = type_filter {
+        keys = filter_keys_by_type(keys, filter.as_ref(), meta, config.num_shards).await?;
+    }
+    keys.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
+    let offset = usize::try_from(cursor).unwrap_or(usize::MAX);
+    if offset >= keys.len() {
+        return Ok((
+            serialize_response(&scan_response(0, &[]), meta.resp_version == 3),
+            false,
+            false,
+            false,
+        ));
+    }
+    let end = offset.saturating_add(count).min(keys.len());
+    let next = if end >= keys.len() { 0 } else { end as u64 };
+    Ok((
+        serialize_response(
+            &scan_response(next, &keys[offset..end]),
+            meta.resp_version == 3,
+        ),
+        false,
+        false,
+        false,
+    ))
+}
+
+async fn dispatch_global_sort_command(
+    meta: &mut ConnectionMeta,
+    command: &[u8],
+    args: &[Frame<'_>],
+    config: &SenkoConfig,
+    tracking_registry: &Rc<RefCell<TrackingRegistry>>,
+) -> Result<(Vec<u8>, bool, bool, bool), ConnectionControl> {
+    let source_keys = fetch_all_keys_matching(b"*", meta, config.num_shards).await?;
+    let destination = find_option_destination(args, &[b"STORE"])?;
+    dispatch_cross_shard_temp_store_command(
+        meta,
+        command,
+        args,
+        config,
+        source_keys,
+        destination,
+        tracking_registry,
+    )
+    .await
+}
+
+fn key_array_response(keys: &[Bytes]) -> Response {
+    Response::Array(Box::new(
+        keys.iter()
+            .map(|key| Response::Value(Some(SenkoValue::Raw(key.clone()))))
+            .collect::<smallvec::SmallVec<[Response; 16]>>(),
+    ))
+}
+
+fn scan_response(next: u64, keys: &[Bytes]) -> Response {
+    Response::Array(Box::new(smallvec::smallvec![
+        Response::Value(Some(SenkoValue::Raw(Bytes::from(next.to_string())))),
+        key_array_response(keys),
+    ]))
+}
+
+async fn fetch_all_keys_matching(
+    pattern: &[u8],
+    meta: &ConnectionMeta,
+    num_shards: usize,
+) -> Result<Vec<Bytes>, ConnectionControl> {
+    let mut out = Vec::new();
+    for shard_id in 0..num_shards {
+        let reply = server_info::execute_store_command_on_shard(
+            shard_id,
+            Bytes::copy_from_slice(b"KEYS"),
+            vec![Bytes::copy_from_slice(pattern)],
+            meta.resp_version == 3,
+            meta.no_touch,
+            meta.id,
+        )
+        .await
+        .map_err(ConnectionControl::Continue)?;
+        out.extend(
+            parse_bulk_array_response(&reply.response)
+                .map_err(ConnectionControl::Continue)?
+                .into_iter()
+                .map(Bytes::from),
+        );
+    }
+    Ok(out)
+}
+
+async fn filter_keys_by_type(
+    keys: Vec<Bytes>,
+    type_filter: &[u8],
+    meta: &ConnectionMeta,
+    num_shards: usize,
+) -> Result<Vec<Bytes>, ConnectionControl> {
+    let mut out = Vec::new();
+    for key in keys {
+        let reply = server_info::execute_store_command_on_shard(
+            shard_for_key(key.as_ref(), num_shards),
+            Bytes::copy_from_slice(b"TYPE"),
+            vec![key.clone()],
+            meta.resp_version == 3,
+            meta.no_touch,
+            meta.id,
+        )
+        .await
+        .map_err(ConnectionControl::Continue)?;
+        if parse_type_name_response(&reply.response)
+            .map_err(ConnectionControl::Continue)?
+            .eq_ignore_ascii_case(type_filter)
+        {
+            out.push(key);
+        }
+    }
+    Ok(out)
+}
+
+fn parse_global_scan_args(
+    args: &[Frame<'_>],
+) -> Result<(u64, Option<Bytes>, usize, Option<Bytes>, bool), ConnectionControl> {
+    if args.is_empty() {
+        return Err(ConnectionControl::Continue(error_message(
+            "ERR wrong number of arguments for 'scan' command",
+        )));
+    }
+    let cursor = parse_u64_bytes(
+        frame_bytes(&args[0]).map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?,
+        "ERR invalid cursor",
+    )?;
+    let mut index = 1usize;
+    let mut pattern = None;
+    let mut count = 10usize;
+    let mut type_filter = None;
+    while index < args.len() {
+        let token = frame_bytes(&args[index])
+            .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
+        if token.eq_ignore_ascii_case(b"MATCH") {
+            index += 1;
+            if index >= args.len() {
+                return Err(ConnectionControl::Continue(error_message(
+                    "ERR syntax error",
+                )));
+            }
+            pattern = Some(
+                frame_bytes(&args[index])
+                    .map(Bytes::copy_from_slice)
+                    .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?,
+            );
+            index += 1;
+            continue;
+        }
+        if token.eq_ignore_ascii_case(b"COUNT") {
+            index += 1;
+            if index >= args.len() {
+                return Err(ConnectionControl::Continue(error_message(
+                    "ERR syntax error",
+                )));
+            }
+            count = parse_usize_bytes(
+                frame_bytes(&args[index])
+                    .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?,
+                "ERR value is not an integer or out of range",
+            )?
+            .max(1);
+            index += 1;
+            continue;
+        }
+        if token.eq_ignore_ascii_case(b"TYPE") {
+            index += 1;
+            if index >= args.len() {
+                return Err(ConnectionControl::Continue(error_message(
+                    "ERR syntax error",
+                )));
+            }
+            type_filter = Some(
+                frame_bytes(&args[index])
+                    .map(Bytes::copy_from_slice)
+                    .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?,
+            );
+            index += 1;
+            continue;
+        }
+        return Err(ConnectionControl::Continue(error_message(
+            "ERR syntax error",
+        )));
+    }
+    let type_filter_valid = type_filter
+        .as_ref()
+        .is_none_or(|filter| is_scan_type_filter(filter.as_ref()));
+    Ok((cursor, pattern, count, type_filter, type_filter_valid))
+}
+
+fn is_scan_type_filter(value: &[u8]) -> bool {
+    value.eq_ignore_ascii_case(b"string")
+        || value.eq_ignore_ascii_case(b"list")
+        || value.eq_ignore_ascii_case(b"set")
+        || value.eq_ignore_ascii_case(b"zset")
+        || value.eq_ignore_ascii_case(b"hash")
+        || value.eq_ignore_ascii_case(b"stream")
+}
+
+async fn hydrate_temp_store_from_keys(
+    keys: &[Bytes],
+    config: &SenkoConfig,
+    meta: &ConnectionMeta,
+) -> Result<Store, ConnectionControl> {
+    let mut store = Store::new(config.max_memory);
+    let mut seen = HashSet::<Vec<u8>, RandomState>::with_hasher(RandomState::default());
+    for key in keys {
+        if !seen.insert(key.to_vec()) {
+            continue;
+        }
+        let shard_id = shard_for_key(key.as_ref(), config.num_shards);
+        if let Some((payload, ttl_ms)) = fetch_dump_payload(key, shard_id, meta).await? {
+            restore_key_into_temp_store(&mut store, key, &payload, ttl_ms)?;
+        }
+    }
+    Ok(store)
+}
+
+fn restore_key_into_temp_store(
+    store: &mut Store,
+    key: &Bytes,
+    payload: &Bytes,
+    ttl_ms: u64,
+) -> Result<(), ConnectionControl> {
+    let args = vec![
+        key.clone(),
+        Bytes::from(ttl_ms.to_string()),
+        payload.clone(),
+    ];
+    let frames = bytes_to_frames(&args);
+    let _ = dispatch::dispatch(store, b"RESTORE", &frames)
+        .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
+    Ok(())
+}
+
+async fn sync_temp_store_key(
+    store: &mut Store,
+    key: &Bytes,
+    config: &SenkoConfig,
+    meta: &ConnectionMeta,
+) -> Result<Option<u64>, ConnectionControl> {
+    let shard_id = shard_for_key(key.as_ref(), config.num_shards);
+    let Some(entry) = store.clone_entry(key.as_ref()) else {
+        let reply = server_info::execute_store_command_on_shard(
+            shard_id,
+            Bytes::copy_from_slice(b"DEL"),
+            vec![key.clone()],
+            meta.resp_version == 3,
+            meta.no_touch,
+            meta.id,
+        )
+        .await
+        .map_err(ConnectionControl::Continue)?;
+        let _ = parse_integer_response(&reply.response).map_err(ConnectionControl::Continue)?;
+        return Ok(reply.replication_offset);
+    };
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let ttl_ms = entry
+        .expires_at
+        .map(|deadline| deadline.saturating_sub(now_ms))
+        .unwrap_or(0);
+    let payload =
+        senko_store::commands::generic::migrate::dump_value(&entry.value, entry.expires_at);
+    let reply = server_info::execute_store_command_on_shard(
+        shard_id,
+        Bytes::copy_from_slice(b"RESTORE"),
+        restore_args(key, ttl_ms, &payload, true),
+        meta.resp_version == 3,
+        meta.no_touch,
+        meta.id,
+    )
+    .await
+    .map_err(ConnectionControl::Continue)?;
+    if !parse_ok_response(&reply.response).map_err(ConnectionControl::Continue)? {
+        return Err(ConnectionControl::Continue(error_message(
+            "ERR shard coordination protocol error",
+        )));
+    }
+    Ok(reply.replication_offset)
+}
+
+fn collect_frame_args(args: &[Frame<'_>]) -> Result<Vec<Bytes>, ConnectionControl> {
+    args.iter()
+        .map(|frame| {
+            frame_bytes(frame)
+                .map(Bytes::copy_from_slice)
+                .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))
+        })
+        .collect()
+}
+
+fn collect_all_arg_keys(args: &[Frame<'_>]) -> Result<Vec<Bytes>, ConnectionControl> {
+    collect_frame_args(args)
+}
+
+fn collect_fixed_arg_keys(
+    args: &[Frame<'_>],
+    indexes: &[usize],
+) -> Result<Vec<Bytes>, ConnectionControl> {
+    indexes
+        .iter()
+        .filter_map(|index| args.get(*index))
+        .map(|frame| {
+            frame_bytes(frame)
+                .map(Bytes::copy_from_slice)
+                .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))
+        })
+        .collect()
+}
+
+fn collect_bitop_source_keys(args: &[Frame<'_>]) -> Result<Vec<Bytes>, ConnectionControl> {
+    if args.len() < 3 {
+        return Err(ConnectionControl::Continue(error_message(
+            "ERR wrong number of arguments for 'bitop' command",
+        )));
+    }
+    collect_frame_args(&args[2..])
+}
+
+fn parse_required_arg_bytes(
+    args: &[Frame<'_>],
+    index: usize,
+    wrong_arity: &str,
+) -> Result<Bytes, ConnectionControl> {
+    let Some(frame) = args.get(index) else {
+        return Err(ConnectionControl::Continue(error_message(wrong_arity)));
+    };
+    frame_bytes(frame)
+        .map(Bytes::copy_from_slice)
+        .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))
+}
+
+fn parse_numkeys_arg(
+    args: &[Frame<'_>],
+    index: usize,
+    zero_message: &str,
+    mismatch_message: &str,
+) -> Result<usize, ConnectionControl> {
+    let raw = parse_required_arg_bytes(args, index, mismatch_message)?;
+    let numkeys = parse_usize_bytes(raw.as_ref(), zero_message)?;
+    if numkeys == 0 {
+        return Err(ConnectionControl::Continue(error_message(zero_message)));
+    }
+    if args.len() < index + 1 + numkeys {
+        return Err(ConnectionControl::Continue(error_message(mismatch_message)));
+    }
+    Ok(numkeys)
+}
+
+fn parse_usize_bytes(raw: &[u8], error_message_text: &str) -> Result<usize, ConnectionControl> {
+    std::str::from_utf8(raw)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .ok_or_else(|| ConnectionControl::Continue(error_message(error_message_text)))
+}
+
+fn parse_u64_bytes(raw: &[u8], error_message_text: &str) -> Result<u64, ConnectionControl> {
+    std::str::from_utf8(raw)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| ConnectionControl::Continue(error_message(error_message_text)))
+}
+
+fn has_geo_store_option(args: &[Frame<'_>]) -> bool {
+    args.iter().any(|frame| {
+        frame_bytes(frame).is_ok_and(|token| {
+            token.eq_ignore_ascii_case(b"STORE") || token.eq_ignore_ascii_case(b"STOREDIST")
+        })
+    })
+}
+
+fn find_option_destination(
+    args: &[Frame<'_>],
+    tokens: &[&[u8]],
+) -> Result<Option<Bytes>, ConnectionControl> {
+    let mut index = 0usize;
+    while index < args.len() {
+        let token = frame_bytes(&args[index])
+            .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
+        if tokens
+            .iter()
+            .any(|expected| token.eq_ignore_ascii_case(expected))
+        {
+            return Ok(args
+                .get(index + 1)
+                .map(|frame| {
+                    frame_bytes(frame)
+                        .map(Bytes::copy_from_slice)
+                        .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))
+                })
+                .transpose()?);
+        }
+        index += 1;
+    }
+    Ok(None)
+}
+
+fn collect_zset_temp_command_keys(
+    command: &[u8],
+    args: &[Frame<'_>],
+) -> Result<(Vec<Bytes>, Option<Bytes>), ConnectionControl> {
+    if eq_ascii(command, b"ZRANGESTORE") {
+        return Ok((
+            collect_fixed_arg_keys(args, &[1])?,
+            Some(parse_required_arg_bytes(
+                args,
+                0,
+                "ERR wrong number of arguments for 'zrangestore' command",
+            )?),
+        ));
+    }
+    if eq_ascii(command, b"ZDIFF")
+        || eq_ascii(command, b"ZINTER")
+        || eq_ascii(command, b"ZUNION")
+        || eq_ascii(command, b"ZINTERCARD")
+    {
+        let numkeys = parse_numkeys_arg(
+            args,
+            0,
+            "ERR numkeys should be greater than 0",
+            "ERR numkeys does not match number of keys",
+        )?;
+        let keys = (1..=numkeys)
+            .map(|index| {
+                parse_required_arg_bytes(args, index, "ERR numkeys does not match number of keys")
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok((keys, None));
+    }
+    let numkeys = parse_numkeys_arg(
+        args,
+        1,
+        "ERR numkeys should be greater than 0",
+        "ERR numkeys does not match number of keys",
+    )?;
+    let keys = (2..2 + numkeys)
+        .map(|index| {
+            parse_required_arg_bytes(args, index, "ERR numkeys does not match number of keys")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((
+        keys,
+        Some(parse_required_arg_bytes(
+            args,
+            0,
+            "ERR wrong number of arguments for zset store command",
+        )?),
+    ))
+}
+
+fn group_key_args(
+    args: &[Frame<'_>],
+    num_shards: usize,
+) -> Result<Vec<(usize, Vec<(usize, Vec<u8>)>)>, Vec<u8>> {
+    let mut grouped = std::collections::BTreeMap::<usize, Vec<(usize, Vec<u8>)>>::new();
+    for (index, frame) in args.iter().enumerate() {
+        let key = frame_bytes(frame)
+            .map_err(|error| error_bytes(&error))?
+            .to_vec();
+        grouped
+            .entry(shard_for_key(&key, num_shards))
+            .or_default()
+            .push((index, key));
+    }
+    Ok(grouped.into_iter().collect())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CrossShardBatchCondition {
+    Always,
+    Nx,
+    Xx,
+}
+
+struct ParsedCrossShardMsetex {
+    numkeys: usize,
+    pair_bytes: Vec<Bytes>,
+    option_bytes: Vec<Bytes>,
+    condition: CrossShardBatchCondition,
+}
+
+fn group_mset_pairs(
+    args: &[Frame<'_>],
+    num_shards: usize,
+) -> Result<Vec<(usize, Vec<Bytes>)>, Vec<u8>> {
+    let mut grouped = std::collections::BTreeMap::<usize, Vec<Bytes>>::new();
+    for chunk in args.chunks(2) {
+        let Some(key_frame) = chunk.first() else {
+            continue;
+        };
+        let key = frame_bytes(key_frame)
+            .map_err(|error| error_bytes(&error))?
+            .to_vec();
+        let shard_id = shard_for_key(&key, num_shards);
+        let bucket = grouped.entry(shard_id).or_default();
+        bucket.push(Bytes::from(key));
+        if let Some(value_frame) = chunk.get(1) {
+            bucket.push(
+                frame_bytes(value_frame)
+                    .map_err(|error| error_bytes(&error))
+                    .map(Bytes::copy_from_slice)?,
+            );
+        }
+    }
+    Ok(grouped.into_iter().collect())
+}
+
+fn group_msetex_pairs(
+    parsed: &ParsedCrossShardMsetex,
+    num_shards: usize,
+) -> Vec<(usize, Vec<Bytes>)> {
+    let mut grouped = std::collections::BTreeMap::<usize, Vec<Bytes>>::new();
+    for chunk in parsed.pair_bytes.chunks(2) {
+        let Some(key) = chunk.first() else {
+            continue;
+        };
+        let shard_id = shard_for_key(key.as_ref(), num_shards);
+        let bucket = grouped.entry(shard_id).or_default();
+        bucket.extend(chunk.iter().cloned());
+    }
+    for bucket in grouped.values_mut() {
+        let local_numkeys = bucket.len() / 2;
+        bucket.insert(0, Bytes::from(local_numkeys.to_string()));
+        bucket.extend(parsed.option_bytes.iter().cloned());
+    }
+    grouped.into_iter().collect()
+}
+
+fn parse_cross_shard_msetex_args(args: &[Frame<'_>]) -> Result<ParsedCrossShardMsetex, Vec<u8>> {
+    let Some(numkeys_frame) = args.first() else {
+        return Err(error_message(
+            "ERR wrong number of arguments for 'msetex' command",
+        ));
+    };
+    let numkeys =
+        std::str::from_utf8(frame_bytes(numkeys_frame).map_err(|error| error_bytes(&error))?)
+            .ok()
+            .and_then(|text| text.parse::<usize>().ok())
+            .ok_or_else(|| error_message("ERR numkeys value is not an integer or out of range"))?;
+    if numkeys == 0 {
+        return Err(error_message("ERR numkeys should be greater than 0"));
+    }
+    let pair_args = numkeys
+        .checked_mul(2)
+        .ok_or_else(|| error_message("ERR syntax error"))?;
+    if args.len() < 1 + pair_args {
+        return Err(error_message(
+            "ERR numkeys does not match number of key-value pairs",
+        ));
+    }
+    let pair_bytes = args[1..1 + pair_args]
+        .iter()
+        .map(|frame| {
+            frame_bytes(frame)
+                .map_err(|error| error_bytes(&error))
+                .map(Bytes::copy_from_slice)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let option_bytes = args[1 + pair_args..]
+        .iter()
+        .map(|frame| {
+            frame_bytes(frame)
+                .map_err(|error| error_bytes(&error))
+                .map(Bytes::copy_from_slice)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut condition = CrossShardBatchCondition::Always;
+    for token in &option_bytes {
+        if token.eq_ignore_ascii_case(b"NX") {
+            condition = CrossShardBatchCondition::Nx;
+        } else if token.eq_ignore_ascii_case(b"XX") {
+            condition = CrossShardBatchCondition::Xx;
+        }
+    }
+    Ok(ParsedCrossShardMsetex {
+        numkeys,
+        pair_bytes,
+        option_bytes,
+        condition,
+    })
+}
+
+async fn cross_shard_exists_count(
+    args: &[Frame<'_>],
+    num_shards: usize,
+    meta: &ConnectionMeta,
+) -> Result<i64, ConnectionControl> {
+    let grouped = group_key_args(args, num_shards).map_err(ConnectionControl::Continue)?;
+    let mut total = 0i64;
+    for (shard_id, entries) in grouped {
+        let shard_args = entries
+            .iter()
+            .map(|(_, bytes)| Bytes::copy_from_slice(bytes.as_slice()))
+            .collect::<Vec<_>>();
+        let reply = server_info::execute_store_command_on_shard(
+            shard_id,
+            Bytes::copy_from_slice(b"EXISTS"),
+            shard_args,
+            meta.resp_version == 3,
+            meta.no_touch,
+            meta.id,
+        )
+        .await
+        .map_err(ConnectionControl::Continue)?;
+        total += parse_integer_response(&reply.response).map_err(ConnectionControl::Continue)?;
+    }
+    Ok(total)
+}
+
+async fn fetch_set_sources(
+    args: &[Bytes],
+    num_shards: usize,
+    meta: &ConnectionMeta,
+) -> Result<Vec<HashSet<Vec<u8>, RandomState>>, ConnectionControl> {
+    let mut sets = Vec::with_capacity(args.len());
+    for key in args {
+        let reply = server_info::execute_store_command_on_shard(
+            shard_for_key(key.as_ref(), num_shards),
+            Bytes::copy_from_slice(b"SMEMBERS"),
+            vec![key.clone()],
+            meta.resp_version == 3,
+            meta.no_touch,
+            meta.id,
+        )
+        .await
+        .map_err(ConnectionControl::Continue)?;
+        let members =
+            parse_bulk_array_response(&reply.response).map_err(ConnectionControl::Continue)?;
+        let mut set = HashSet::with_hasher(RandomState::default());
+        for member in members {
+            set.insert(member);
+        }
+        sets.push(set);
+    }
+    Ok(sets)
+}
+
+fn compute_cross_shard_sdiff(sets: &[HashSet<Vec<u8>, RandomState>]) -> Vec<Vec<u8>> {
+    let Some(first) = sets.first() else {
+        return Vec::new();
+    };
+    let mut current = first.clone();
+    for other in &sets[1..] {
+        current.retain(|member| !other.contains(member));
+        if current.is_empty() {
+            break;
+        }
+    }
+    current.into_iter().collect()
+}
+
+fn compute_cross_shard_sinter(
+    sets: &[HashSet<Vec<u8>, RandomState>],
+    limit: Option<usize>,
+) -> Vec<Vec<u8>> {
+    let Some(first) = sets.first() else {
+        return Vec::new();
+    };
+    let mut current = first.clone();
+    for other in &sets[1..] {
+        current.retain(|member| other.contains(member));
+        if current.is_empty() {
+            break;
+        }
+    }
+    let mut members = current.into_iter().collect::<Vec<_>>();
+    if let Some(limit) = limit {
+        members.truncate(limit);
+    }
+    members
+}
+
+fn compute_cross_shard_sunion(sets: &[HashSet<Vec<u8>, RandomState>]) -> Vec<Vec<u8>> {
+    let mut out = HashSet::with_hasher(RandomState::default());
+    for set in sets {
+        out.extend(set.iter().cloned());
+    }
+    out.into_iter().collect()
+}
+
+fn set_members_response(members: &[Vec<u8>]) -> Response {
+    Response::Array(Box::new(
+        members
+            .iter()
+            .map(|member| Response::Value(Some(SenkoValue::Raw(Bytes::copy_from_slice(member)))))
+            .collect::<smallvec::SmallVec<[Response; 16]>>(),
+    ))
+}
+
+fn parse_bulk_array_response(bytes: &[u8]) -> Result<Vec<Vec<u8>>, Vec<u8>> {
+    let frame = parse_single_response_frame(bytes)?;
+    if let Frame::SimpleError(error) | Frame::BlobError(error) = frame {
+        return Err(error.to_vec());
+    }
+    let Frame::Array(values) = frame else {
+        return Err(error_message("ERR shard coordination protocol error"));
+    };
+    values
+        .iter()
+        .map(|value| match value.map_err(|error| error_bytes(&error))? {
+            Frame::BulkString(bytes) | Frame::SimpleString(bytes) => Ok(bytes.to_vec()),
+            Frame::Null => Ok(Vec::new()),
+            Frame::SimpleError(error) | Frame::BlobError(error) => Err(error.to_vec()),
+            _ => Err(error_message("ERR shard coordination protocol error")),
+        })
+        .collect()
+}
+
+fn parse_cross_shard_sintercard_args(
+    args: &[Frame<'_>],
+) -> Result<(Vec<Bytes>, Option<usize>), ConnectionControl> {
+    if args.len() < 2 {
+        return Err(ConnectionControl::Continue(error_message(
+            "ERR wrong number of arguments for 'sintercard' command",
+        )));
+    }
+    let numkeys = std::str::from_utf8(
+        frame_bytes(&args[0]).map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?,
+    )
+    .ok()
+    .and_then(|value| value.parse::<usize>().ok())
+    .ok_or_else(|| {
+        ConnectionControl::Continue(error_message("ERR numkeys should be greater than 0"))
+    })?;
+    if numkeys == 0 {
+        return Err(ConnectionControl::Continue(error_message(
+            "ERR numkeys should be greater than 0",
+        )));
+    }
+    if args.len() < 1 + numkeys {
+        return Err(ConnectionControl::Continue(error_message(
+            "ERR syntax error",
+        )));
+    }
+    let limit = if args.len() == 1 + numkeys {
+        None
+    } else if args.len() == 3 + numkeys {
+        let token = frame_bytes(&args[1 + numkeys])
+            .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
+        if !token.eq_ignore_ascii_case(b"LIMIT") {
+            return Err(ConnectionControl::Continue(error_message(
+                "ERR syntax error",
+            )));
+        }
+        Some(
+            std::str::from_utf8(
+                frame_bytes(&args[2 + numkeys])
+                    .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?,
+            )
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0)
+            .max(0) as usize,
+        )
+    } else {
+        return Err(ConnectionControl::Continue(error_message(
+            "ERR syntax error",
+        )));
+    };
+    Ok((
+        args[1..1 + numkeys]
+            .iter()
+            .map(|frame| {
+                frame_bytes(frame)
+                    .map(Bytes::copy_from_slice)
+                    .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        limit.filter(|limit| *limit > 0),
+    ))
+}
+
+fn parse_cross_shard_set_store_args(
+    command: &[u8],
+    args: &[Frame<'_>],
+) -> Result<(Bytes, Vec<Bytes>), ConnectionControl> {
+    if args.len() < 2 {
+        let message = if eq_ascii(command, b"SDIFFSTORE") {
+            "ERR wrong number of arguments for 'sdiffstore' command"
+        } else if eq_ascii(command, b"SINTERSTORE") {
+            "ERR wrong number of arguments for 'sinterstore' command"
+        } else {
+            "ERR wrong number of arguments for 'sunionstore' command"
+        };
+        return Err(ConnectionControl::Continue(error_message(message)));
+    }
+    let destination = frame_bytes(&args[0])
+        .map(Bytes::copy_from_slice)
+        .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
+    let sources = args[1..]
+        .iter()
+        .map(|frame| {
+            frame_bytes(frame)
+                .map(Bytes::copy_from_slice)
+                .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((destination, sources))
+}
+
+async fn write_cross_shard_set_result(
+    destination: &[u8],
+    members: &[Vec<u8>],
+    num_shards: usize,
+    meta: &ConnectionMeta,
+) -> Result<Option<u64>, ConnectionControl> {
+    let shard_id = shard_for_key(destination, num_shards);
+    let mut max_offset = None;
+    let delete_reply = server_info::execute_store_command_on_shard(
+        shard_id,
+        Bytes::copy_from_slice(b"DEL"),
+        vec![Bytes::copy_from_slice(destination)],
+        meta.resp_version == 3,
+        meta.no_touch,
+        meta.id,
+    )
+    .await
+    .map_err(ConnectionControl::Continue)?;
+    max_offset = max_offset.max(delete_reply.replication_offset);
+    if members.is_empty() {
+        return Ok(max_offset);
+    }
+    let mut args = Vec::with_capacity(members.len() + 1);
+    args.push(Bytes::copy_from_slice(destination));
+    args.extend(members.iter().map(|member| Bytes::copy_from_slice(member)));
+    let add_reply = server_info::execute_store_command_on_shard(
+        shard_id,
+        Bytes::copy_from_slice(b"SADD"),
+        args,
+        meta.resp_version == 3,
+        meta.no_touch,
+        meta.id,
+    )
+    .await
+    .map_err(ConnectionControl::Continue)?;
+    let _ = parse_integer_response(&add_reply.response).map_err(ConnectionControl::Continue)?;
+    max_offset = max_offset.max(add_reply.replication_offset);
+    Ok(max_offset)
+}
+
+fn parse_single_response_frame<'a>(bytes: &'a [u8]) -> Result<Frame<'a>, Vec<u8>> {
+    match RESP_PARSER
+        .parse(bytes)
+        .map_err(|error| error_bytes(&error))?
+    {
+        ParseStatus::Complete(frame, used) if used == bytes.len() => Ok(frame),
+        _ => Err(error_message("ERR shard coordination protocol error")),
+    }
+}
+
+fn parse_optional_bytes_response(bytes: &[u8]) -> Result<Option<Vec<u8>>, Vec<u8>> {
+    match parse_single_response_frame(bytes)? {
+        Frame::BulkString(value) | Frame::SimpleString(value) => Ok(Some(value.to_vec())),
+        Frame::Null => Ok(None),
+        Frame::SimpleError(error) | Frame::BlobError(error) => Err(error.to_vec()),
+        _ => Err(error_message("ERR shard coordination protocol error")),
+    }
+}
+
+fn parse_response(bytes: &[u8]) -> Result<Response, Vec<u8>> {
+    frame_to_response(parse_single_response_frame(bytes)?)
+}
+
+fn is_null_response(bytes: &[u8]) -> Result<bool, Vec<u8>> {
+    match parse_single_response_frame(bytes)? {
+        Frame::Null => Ok(true),
+        Frame::SimpleError(error) | Frame::BlobError(error) => Err(error.to_vec()),
+        _ => Ok(false),
+    }
+}
+
+fn frame_to_response(frame: Frame<'_>) -> Result<Response, Vec<u8>> {
+    match frame {
+        Frame::SimpleString(value) | Frame::BulkString(value) => Ok(Response::Value(Some(
+            SenkoValue::Raw(Bytes::copy_from_slice(value)),
+        ))),
+        Frame::Integer(value) => Ok(Response::Integer(value)),
+        Frame::Null => Ok(Response::Value(None)),
+        Frame::Array(values) => Ok(Response::Array(Box::new(
+            values
+                .iter()
+                .map(|value| {
+                    value
+                        .map_err(|error| error_bytes(&error))
+                        .and_then(frame_to_response)
+                })
+                .collect::<Result<smallvec::SmallVec<[Response; 16]>, _>>()?,
+        ))),
+        Frame::SimpleError(error) | Frame::BlobError(error) => Err(error.to_vec()),
+        _ => Err(error_message("ERR shard coordination protocol error")),
+    }
+}
+
+fn parse_integer_response(bytes: &[u8]) -> Result<i64, Vec<u8>> {
+    match parse_single_response_frame(bytes)? {
+        Frame::Integer(value) => Ok(value),
+        Frame::SimpleError(error) | Frame::BlobError(error) => Err(error.to_vec()),
+        _ => Err(error_message("ERR shard coordination protocol error")),
+    }
+}
+
+fn parse_ok_response(bytes: &[u8]) -> Result<bool, Vec<u8>> {
+    match parse_single_response_frame(bytes)? {
+        Frame::SimpleString(value) => Ok(value.eq_ignore_ascii_case(b"OK")),
+        Frame::SimpleError(error) | Frame::BlobError(error) => Err(error.to_vec()),
+        _ => Err(error_message("ERR shard coordination protocol error")),
+    }
+}
+
+fn parse_type_name_response(bytes: &[u8]) -> Result<Vec<u8>, Vec<u8>> {
+    match parse_single_response_frame(bytes)? {
+        Frame::BulkString(value) | Frame::SimpleString(value) => Ok(value.to_vec()),
+        Frame::SimpleError(error) | Frame::BlobError(error) => Err(error.to_vec()),
+        _ => Err(error_message("ERR shard coordination protocol error")),
+    }
+}
+
+fn random_index(len: usize) -> usize {
+    if len <= 1 {
+        return 0;
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    (nanos % len as u128) as usize
+}
+
+fn parse_mget_response(bytes: &[u8]) -> Result<Vec<Response>, Vec<u8>> {
+    let frame = parse_single_response_frame(bytes)?;
+    if let Frame::SimpleError(error) | Frame::BlobError(error) = frame {
+        return Err(error.to_vec());
+    }
+    let Frame::Array(values) = frame else {
+        return Err(error_message("ERR shard coordination protocol error"));
+    };
+    values
+        .iter()
+        .map(|value| match value.map_err(|error| error_bytes(&error))? {
+            Frame::BulkString(bytes) | Frame::SimpleString(bytes) => Ok(Response::Value(Some(
+                SenkoValue::Raw(Bytes::copy_from_slice(bytes)),
+            ))),
+            Frame::Null => Ok(Response::Value(None)),
+            Frame::SimpleError(error) | Frame::BlobError(error) => Err(error.to_vec()),
+            _ => Err(error_message("ERR shard coordination protocol error")),
+        })
+        .collect()
+}
+
+fn parse_cross_shard_two_keys(
+    args: &[Frame<'_>],
+    wrong_arity: &str,
+    validate_destination_utf8: bool,
+) -> Result<(Bytes, Bytes), ConnectionControl> {
+    if args.len() != 2 {
+        return Err(ConnectionControl::Continue(error_message(wrong_arity)));
+    }
+    let source = frame_bytes(&args[0])
+        .map(Bytes::copy_from_slice)
+        .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
+    let destination = frame_bytes(&args[1])
+        .map(Bytes::copy_from_slice)
+        .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
+    if validate_destination_utf8 && std::str::from_utf8(destination.as_ref()).is_err() {
+        return Err(ConnectionControl::Continue(error_message(
+            "ERR invalid UTF-8 key",
+        )));
+    }
+    Ok((source, destination))
+}
+
+fn parse_cross_shard_copy_args(
+    args: &[Frame<'_>],
+) -> Result<(Bytes, Bytes, bool), ConnectionControl> {
+    if args.len() < 2 {
+        return Err(ConnectionControl::Continue(error_message(
+            "ERR wrong number of arguments for 'copy' command",
+        )));
+    }
+    let source = frame_bytes(&args[0])
+        .map(Bytes::copy_from_slice)
+        .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
+    let destination = frame_bytes(&args[1])
+        .map(Bytes::copy_from_slice)
+        .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
+    if std::str::from_utf8(destination.as_ref()).is_err() {
+        return Err(ConnectionControl::Continue(error_message(
+            "ERR invalid UTF-8 key",
+        )));
+    }
+    let mut replace = false;
+    let mut index = 2usize;
+    while index < args.len() {
+        let token = frame_bytes(&args[index])
+            .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
+        if token.eq_ignore_ascii_case(b"REPLACE") {
+            replace = true;
+            index += 1;
+            continue;
+        }
+        if token.eq_ignore_ascii_case(b"DB") {
+            index += 1;
+            if index >= args.len() {
+                return Err(ConnectionControl::Continue(error_message(
+                    "ERR syntax error",
+                )));
+            }
+            let db = frame_bytes(&args[index])
+                .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
+            let Some(db) = std::str::from_utf8(db)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+            else {
+                return Err(ConnectionControl::Continue(error_message(
+                    "ERR invalid DB index",
+                )));
+            };
+            if db != 0 {
+                return Err(ConnectionControl::Continue(error_message(
+                    "ERR invalid DB index",
+                )));
+            }
+            index += 1;
+            continue;
+        }
+        return Err(ConnectionControl::Continue(error_message(
+            "ERR syntax error",
+        )));
+    }
+    Ok((source, destination, replace))
+}
+
+fn parse_cross_shard_list_move_args<'a>(
+    command: &[u8],
+    args: &'a [Frame<'_>],
+) -> Result<(Bytes, Bytes, &'static [u8], &'static [u8]), ConnectionControl> {
+    let (source, destination, from, to) = if eq_ascii(command, b"RPOPLPUSH") {
+        if args.len() != 2 {
+            return Err(ConnectionControl::Continue(error_message(
+                "ERR wrong number of arguments for 'rpoplpush' command",
+            )));
+        }
+        (
+            frame_bytes(&args[0])
+                .map(Bytes::copy_from_slice)
+                .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?,
+            frame_bytes(&args[1])
+                .map(Bytes::copy_from_slice)
+                .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?,
+            b"RPOP".as_slice(),
+            b"LPUSH".as_slice(),
+        )
+    } else {
+        if args.len() != 4 {
+            return Err(ConnectionControl::Continue(error_message(
+                "ERR wrong number of arguments for 'lmove' command",
+            )));
+        }
+        let from = frame_bytes(&args[2])
+            .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
+        let to = frame_bytes(&args[3])
+            .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
+        let pop = if from.eq_ignore_ascii_case(b"LEFT") {
+            b"LPOP".as_slice()
+        } else if from.eq_ignore_ascii_case(b"RIGHT") {
+            b"RPOP".as_slice()
+        } else {
+            return Err(ConnectionControl::Continue(error_message(
+                "ERR syntax error",
+            )));
+        };
+        let push = if to.eq_ignore_ascii_case(b"LEFT") {
+            b"LPUSH".as_slice()
+        } else if to.eq_ignore_ascii_case(b"RIGHT") {
+            b"RPUSH".as_slice()
+        } else {
+            return Err(ConnectionControl::Continue(error_message(
+                "ERR syntax error",
+            )));
+        };
+        (
+            frame_bytes(&args[0])
+                .map(Bytes::copy_from_slice)
+                .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?,
+            frame_bytes(&args[1])
+                .map(Bytes::copy_from_slice)
+                .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?,
+            pop,
+            push,
+        )
+    };
+    Ok((source, destination, from, to))
+}
+
+async fn ensure_remote_type(
+    shard_id: usize,
+    key: &Bytes,
+    expected: &[u8],
+    meta: &ConnectionMeta,
+) -> Result<(), ConnectionControl> {
+    let reply = server_info::execute_store_command_on_shard(
+        shard_id,
+        Bytes::copy_from_slice(b"TYPE"),
+        vec![key.clone()],
+        meta.resp_version == 3,
+        meta.no_touch,
+        meta.id,
+    )
+    .await
+    .map_err(ConnectionControl::Continue)?;
+    let value = parse_type_name_response(&reply.response).map_err(ConnectionControl::Continue)?;
+    if value != b"none" && value != expected {
+        return Err(ConnectionControl::Continue(error_message(
+            "WRONGTYPE Operation against a key holding the wrong kind of value",
+        )));
+    }
+    Ok(())
+}
+
+async fn fetch_dump_payload(
+    source: &Bytes,
+    shard_id: usize,
+    meta: &ConnectionMeta,
+) -> Result<Option<(Bytes, u64)>, ConnectionControl> {
+    let dump_reply = server_info::execute_store_command_on_shard(
+        shard_id,
+        Bytes::copy_from_slice(b"DUMP"),
+        vec![source.clone()],
+        meta.resp_version == 3,
+        meta.no_touch,
+        meta.id,
+    )
+    .await
+    .map_err(ConnectionControl::Continue)?;
+    let Some(payload) =
+        parse_optional_bytes_response(&dump_reply.response).map_err(ConnectionControl::Continue)?
+    else {
+        return Ok(None);
+    };
+    let ttl_reply = server_info::execute_store_command_on_shard(
+        shard_id,
+        Bytes::copy_from_slice(b"PTTL"),
+        vec![source.clone()],
+        meta.resp_version == 3,
+        meta.no_touch,
+        meta.id,
+    )
+    .await
+    .map_err(ConnectionControl::Continue)?;
+    let ttl = parse_integer_response(&ttl_reply.response).map_err(ConnectionControl::Continue)?;
+    Ok(Some((Bytes::from(payload), ttl.max(0) as u64)))
+}
+
+fn restore_args(destination: &Bytes, ttl_ms: u64, payload: &Bytes, replace: bool) -> Vec<Bytes> {
+    let mut args = vec![
+        destination.clone(),
+        Bytes::from(ttl_ms.to_string()),
+        payload.clone(),
+    ];
+    if replace {
+        args.push(Bytes::copy_from_slice(b"REPLACE"));
+    }
+    args
+}
+
+#[inline]
+fn target_shard_for_keys(keys: &[Vec<u8>], num_shards: usize) -> Option<usize> {
+    let mut iter = keys.iter();
+    let first = shard_for_key(iter.next()?.as_slice(), num_shards);
+    if iter.all(|key| shard_for_key(key.as_slice(), num_shards) == first) {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+fn target_shard_for_byte_keys(keys: &[Bytes], num_shards: usize) -> Option<usize> {
+    let mut iter = keys.iter();
+    let first = shard_for_key(iter.next()?.as_ref(), num_shards);
+    if iter.all(|key| shard_for_key(key.as_ref(), num_shards) == first) {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn shard_for_key(key: &[u8], num_shards: usize) -> usize {
+    usize::from(senko_cluster::crc16_slot(key)) % num_shards.max(1)
+}
+
+#[inline]
+fn is_local_only_store_command(command: &[u8]) -> bool {
+    eq_ascii(command, b"BLPOP")
+        || eq_ascii(command, b"BRPOP")
+        || eq_ascii(command, b"BLMOVE")
+        || eq_ascii(command, b"BRPOPLPUSH")
+        || eq_ascii(command, b"BLMPOP")
+        || eq_ascii(command, b"BZPOPMIN")
+        || eq_ascii(command, b"BZPOPMAX")
+        || eq_ascii(command, b"BZMPOP")
+        || eq_ascii(command, b"XREAD")
+        || eq_ascii(command, b"XREADGROUP")
 }
 
 #[inline]
@@ -1848,30 +4271,28 @@ fn diagnostics_command(frame: Frame<'_>) -> Option<(Vec<u8>, Vec<Frame<'_>>)> {
     Some((command, frames[1..].to_vec()))
 }
 
-fn dispatch_key_lifecycle_command(
+pub(crate) fn dispatch_key_lifecycle_command(
     command: &[u8],
     args: &[Frame<'_>],
     store: &Rc<RefCell<Store>>,
     blocked: &Rc<RefCell<BlockedKeyRegistry>>,
     watch_registry: &Rc<RefCell<WatchRegistry>>,
     connections: &Rc<RefCell<ConnectionMap>>,
-    meta: &ConnectionMeta,
-) -> Result<Option<Vec<u8>>, ConnectionControl> {
+    resp3: bool,
+) -> Result<Option<Vec<u8>>, Vec<u8>> {
     if eq_ascii(command, b"DEL") || eq_ascii(command, b"UNLINK") {
         if args.is_empty() {
-            return Err(ConnectionControl::Continue(error_message(
-                if eq_ascii(command, b"DEL") {
-                    "ERR wrong number of arguments for 'del' command"
-                } else {
-                    "ERR wrong number of arguments for 'unlink' command"
-                },
-            )));
+            return Err(error_message(if eq_ascii(command, b"DEL") {
+                "ERR wrong number of arguments for 'del' command"
+            } else {
+                "ERR wrong number of arguments for 'unlink' command"
+            }));
         }
         let keys = args
             .iter()
             .map(frame_bytes)
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
+            .map_err(|error| error_bytes(&error))?;
         let response = {
             let mut store_ref = store.borrow_mut();
             let outcome = generic_keys::delete_keys(&mut store_ref, &keys);
@@ -1886,23 +4307,22 @@ fn dispatch_key_lifecycle_command(
             }
             Response::Integer(outcome.count as i64)
         };
-        return Ok(Some(serialize_response(&response, meta.resp_version == 3)));
+        return Ok(Some(serialize_response(&response, resp3)));
     }
 
     if eq_ascii(command, b"RENAME") {
         if args.len() != 2 {
-            return Err(ConnectionControl::Continue(error_message(
+            return Err(error_message(
                 "ERR wrong number of arguments for 'rename' command",
-            )));
+            ));
         }
-        let source = frame_bytes(&args[0])
-            .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
+        let source = frame_bytes(&args[0]).map_err(|error| error_bytes(&error))?;
         let destination = parse_compact_key(&args[1])?;
         let source_key = CompactString::from_utf8(source).ok();
         let (response, outcome) = {
             let mut store_ref = store.borrow_mut();
             let outcome = generic_keys::rename_key(&mut store_ref, source, destination, true)
-                .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
+                .map_err(|error| error_bytes(&error))?;
             let mut watched_keys = Vec::new();
             if let Some(source_key) = &source_key {
                 watched_keys.push(source_key.clone());
@@ -1927,23 +4347,22 @@ fn dispatch_key_lifecycle_command(
             (response, outcome)
         };
         let _ = outcome;
-        return Ok(Some(serialize_response(&response, meta.resp_version == 3)));
+        return Ok(Some(serialize_response(&response, resp3)));
     }
 
     if eq_ascii(command, b"RENAMENX") {
         if args.len() != 2 {
-            return Err(ConnectionControl::Continue(error_message(
+            return Err(error_message(
                 "ERR wrong number of arguments for 'renamenx' command",
-            )));
+            ));
         }
-        let source = frame_bytes(&args[0])
-            .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
+        let source = frame_bytes(&args[0]).map_err(|error| error_bytes(&error))?;
         let destination = parse_compact_key(&args[1])?;
         let response = {
             let mut store_ref = store.borrow_mut();
             let source_type = store_ref.type_name(source);
             let renamed = generic_keys::rename_nx_key(&mut store_ref, source, destination)
-                .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
+                .map_err(|error| error_bytes(&error))?;
             if renamed {
                 let mut watched_keys = Vec::new();
                 if let Ok(source_key) = CompactString::from_utf8(source) {
@@ -1960,11 +4379,9 @@ fn dispatch_key_lifecycle_command(
                         if let Ok(source_key) = CompactString::from_utf8(source) {
                             let _ = registry.cancel_waiters(&source_key);
                         }
-                        if let Ok(destination_key) =
-                            CompactString::from_utf8(frame_bytes(&args[1]).map_err(|error| {
-                                ConnectionControl::Continue(error_bytes(&error))
-                            })?)
-                        {
+                        if let Ok(destination_key) = CompactString::from_utf8(
+                            frame_bytes(&args[1]).map_err(|error| error_bytes(&error))?,
+                        ) {
                             while registry.notify(&destination_key, &mut store_ref).is_some() {}
                         }
                     }
@@ -1972,24 +4389,23 @@ fn dispatch_key_lifecycle_command(
             }
             Response::Integer(renamed as i64)
         };
-        return Ok(Some(serialize_response(&response, meta.resp_version == 3)));
+        return Ok(Some(serialize_response(&response, resp3)));
     }
 
     if eq_ascii(command, b"COPY") {
         if args.len() < 2 {
-            return Err(ConnectionControl::Continue(error_message(
+            return Err(error_message(
                 "ERR wrong number of arguments for 'copy' command",
-            )));
+            ));
         }
-        let source = frame_bytes(&args[0])
-            .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
+        let source = frame_bytes(&args[0]).map_err(|error| error_bytes(&error))?;
         let destination = parse_compact_key(&args[1])?;
         let (replace, db) = parse_copy_lifecycle_options(&args[2..])?;
         let destination_key = destination.clone();
         let response = {
             let mut store_ref = store.borrow_mut();
             let outcome = generic_keys::copy_key(&mut store_ref, source, destination, replace, db)
-                .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
+                .map_err(|error| error_bytes(&error))?;
             if outcome.is_some() {
                 notify_keys_written(
                     std::slice::from_ref(&destination_key),
@@ -2009,27 +4425,24 @@ fn dispatch_key_lifecycle_command(
             }
             Response::Integer(outcome.is_some() as i64)
         };
-        return Ok(Some(serialize_response(&response, meta.resp_version == 3)));
+        return Ok(Some(serialize_response(&response, resp3)));
     }
 
     Ok(None)
 }
 
-fn parse_compact_key(frame: &Frame<'_>) -> Result<CompactString, ConnectionControl> {
-    let bytes =
-        frame_bytes(frame).map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
-    CompactString::from_utf8(bytes).map_err(|_| {
-        ConnectionControl::Continue(error_bytes(&SenkoError::Protocol("invalid UTF-8 key")))
-    })
+fn parse_compact_key(frame: &Frame<'_>) -> Result<CompactString, Vec<u8>> {
+    let bytes = frame_bytes(frame).map_err(|error| error_bytes(&error))?;
+    CompactString::from_utf8(bytes)
+        .map_err(|_| error_bytes(&SenkoError::Protocol("invalid UTF-8 key")))
 }
 
-fn parse_copy_lifecycle_options(args: &[Frame<'_>]) -> Result<(bool, u64), ConnectionControl> {
+fn parse_copy_lifecycle_options(args: &[Frame<'_>]) -> Result<(bool, u64), Vec<u8>> {
     let mut replace = false;
     let mut db = 0u64;
     let mut index = 0usize;
     while index < args.len() {
-        let token = frame_bytes(&args[index])
-            .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
+        let token = frame_bytes(&args[index]).map_err(|error| error_bytes(&error))?;
         if eq_ascii(token, b"REPLACE") {
             replace = true;
             index += 1;
@@ -2038,24 +4451,17 @@ fn parse_copy_lifecycle_options(args: &[Frame<'_>]) -> Result<(bool, u64), Conne
         if eq_ascii(token, b"DB") {
             index += 1;
             if index >= args.len() {
-                return Err(ConnectionControl::Continue(error_message(
-                    "ERR syntax error",
-                )));
+                return Err(error_message("ERR syntax error"));
             }
-            let raw = frame_bytes(&args[index])
-                .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
+            let raw = frame_bytes(&args[index]).map_err(|error| error_bytes(&error))?;
             db = std::str::from_utf8(raw)
                 .ok()
                 .and_then(|text| text.parse::<u64>().ok())
-                .ok_or_else(|| {
-                    ConnectionControl::Continue(error_message("ERR invalid DB index"))
-                })?;
+                .ok_or_else(|| error_message("ERR invalid DB index"))?;
             index += 1;
             continue;
         }
-        return Err(ConnectionControl::Continue(error_message(
-            "ERR syntax error",
-        )));
+        return Err(error_message("ERR syntax error"));
     }
     Ok((replace, db))
 }
@@ -2121,7 +4527,10 @@ pub(crate) fn write_response(out: &mut BytesMut, response: &Response, resp3: boo
 fn write_value(out: &mut BytesMut, value: &SenkoValue) {
     match value {
         SenkoValue::Raw(raw) => RespSerializer::write_bulk_string(out, raw),
-        SenkoValue::Int(value) => RespSerializer::write_integer(out, *value),
+        SenkoValue::Int(value) => {
+            let rendered = value.to_string();
+            RespSerializer::write_bulk_string(out, rendered.as_bytes());
+        }
         SenkoValue::Float(value) => {
             let rendered = value.to_string();
             RespSerializer::write_bulk_string(out, rendered.as_bytes());
@@ -2255,14 +4664,788 @@ fn current_unix_us() -> u64 {
         .unwrap_or(0)
 }
 
-fn eq_ascii(left: &[u8], right: &[u8]) -> bool {
+pub(crate) fn eq_ascii(left: &[u8], right: &[u8]) -> bool {
     left.eq_ignore_ascii_case(right)
+}
+
+const UNBALANCED_XREAD_ERROR: &str =
+    "ERR Unbalanced XREAD list of streams: for each stream key an ID or '$' must be specified";
+
+async fn dispatch_cross_shard_blocking_command(
+    command: &[u8],
+    args: &[Frame<'_>],
+    config: &SenkoConfig,
+    shard_id: usize,
+    meta: &mut ConnectionMeta,
+) -> Result<Option<Response>, ConnectionControl> {
+    let mut temp_store = Store::new(config.max_memory);
+    if eq_ascii(command, b"BLPOP")
+        || eq_ascii(command, b"BRPOP")
+        || eq_ascii(command, b"BLMOVE")
+        || eq_ascii(command, b"BRPOPLPUSH")
+        || eq_ascii(command, b"BLMPOP")
+    {
+        let parsed = if eq_ascii(command, b"BLPOP") {
+            blpop(&mut temp_store, args)
+        } else if eq_ascii(command, b"BRPOP") {
+            brpop(&mut temp_store, args)
+        } else if eq_ascii(command, b"BLMOVE") {
+            blmove(&mut temp_store, args)
+        } else if eq_ascii(command, b"BRPOPLPUSH") {
+            brpoplpush(&mut temp_store, args)
+        } else {
+            blmpop(&mut temp_store, args)
+        }
+        .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
+        let BlockingCommandResult::Block(spec) = parsed else {
+            return Err(ConnectionControl::Continue(error_message(
+                "ERR shard coordination protocol error",
+            )));
+        };
+        return poll_cross_shard_list_block(spec, config, meta)
+            .await
+            .map(Some);
+    }
+    if eq_ascii(command, b"BZPOPMIN")
+        || eq_ascii(command, b"BZPOPMAX")
+        || eq_ascii(command, b"BZMPOP")
+    {
+        let parsed = if eq_ascii(command, b"BZPOPMIN") {
+            bzpopmin(&mut temp_store, args)
+        } else if eq_ascii(command, b"BZPOPMAX") {
+            bzpopmax(&mut temp_store, args)
+        } else {
+            bzmpop(&mut temp_store, args)
+        }
+        .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
+        let ZBlockingCommandResult::Block(spec) = parsed else {
+            return Err(ConnectionControl::Continue(error_message(
+                "ERR shard coordination protocol error",
+            )));
+        };
+        return poll_cross_shard_zset_block(spec, config, meta)
+            .await
+            .map(Some);
+    }
+    if eq_ascii(command, b"XREAD") {
+        let stream_keys = collect_xread_keys(args)?;
+        if let Some(target_shard) = target_shard_for_byte_keys(&stream_keys, config.num_shards) {
+            if target_shard == shard_id {
+                return Ok(None);
+            }
+            let routed_args = collect_frame_args(args)?;
+            let reply = server_info::execute_store_command_on_shard(
+                target_shard,
+                Bytes::copy_from_slice(command),
+                routed_args,
+                meta.resp_version == 3,
+                meta.no_touch,
+                meta.id,
+            )
+            .await
+            .map_err(ConnectionControl::Continue)?;
+            return parse_response(&reply.response)
+                .map(Some)
+                .map_err(ConnectionControl::Continue);
+        }
+        let mut temp_store = hydrate_temp_store_from_keys(&stream_keys, config, meta).await?;
+        let parsed = xread(&mut temp_store, args)
+            .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
+        return match parsed {
+            StreamBlockingCommandResult::Immediate(_) => {
+                execute_grouped_xread(meta, &strip_block_option(args)?, config.num_shards)
+                    .await
+                    .map(Some)
+            }
+            StreamBlockingCommandResult::Block(spec) => {
+                poll_cross_shard_xread_block(spec, config, meta)
+                    .await
+                    .map(Some)
+            }
+        };
+    }
+    if eq_ascii(command, b"XREADGROUP") {
+        let stream_keys = collect_xreadgroup_keys(args)?;
+        if let Some(target_shard) = target_shard_for_byte_keys(&stream_keys, config.num_shards) {
+            if target_shard == shard_id {
+                return Ok(None);
+            }
+            let routed_args = collect_frame_args(args)?;
+            let reply = server_info::execute_store_command_on_shard(
+                target_shard,
+                Bytes::copy_from_slice(command),
+                routed_args,
+                meta.resp_version == 3,
+                meta.no_touch,
+                meta.id,
+            )
+            .await
+            .map_err(ConnectionControl::Continue)?;
+            if let Some(offset) = reply.replication_offset {
+                meta.last_write_replication_offset = offset;
+            }
+            return parse_response(&reply.response)
+                .map(Some)
+                .map_err(ConnectionControl::Continue);
+        }
+        let mut temp_store = hydrate_temp_store_from_keys(&stream_keys, config, meta).await?;
+        let parsed = xreadgroup(&mut temp_store, args)
+            .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
+        return match parsed {
+            StreamGroupBlockingCommandResult::Immediate(_) => {
+                execute_grouped_xreadgroup(meta, &strip_block_option(args)?, config.num_shards)
+                    .await
+                    .map(Some)
+            }
+            StreamGroupBlockingCommandResult::Block(spec) => {
+                poll_cross_shard_xreadgroup_block(spec, config, meta)
+                    .await
+                    .map(Some)
+            }
+        };
+    }
+    Ok(None)
+}
+
+async fn poll_cross_shard_list_block(
+    spec: BlockSpec,
+    config: &SenkoConfig,
+    meta: &mut ConnectionMeta,
+) -> Result<Response, ConnectionControl> {
+    if let StoreBlockingOp::Move { dest, .. } | StoreBlockingOp::MoveDeprecated { dest } = &spec.op
+    {
+        ensure_remote_type(
+            shard_for_key(dest.as_bytes(), config.num_shards),
+            &Bytes::copy_from_slice(dest.as_bytes()),
+            b"list",
+            meta,
+        )
+        .await?;
+    }
+    let deadline = spec.timeout.map(|timeout| Instant::now() + timeout);
+    loop {
+        match &spec.op {
+            StoreBlockingOp::Pop { direction } => {
+                let pop_command = if *direction == BlockSpecDirection::Left {
+                    b"LPOP".as_slice()
+                } else {
+                    b"RPOP".as_slice()
+                };
+                for key in &spec.keys {
+                    let key_bytes = Bytes::copy_from_slice(key.as_bytes());
+                    let reply = server_info::execute_store_command_on_shard(
+                        shard_for_key(key.as_bytes(), config.num_shards),
+                        Bytes::copy_from_slice(pop_command),
+                        vec![key_bytes.clone()],
+                        meta.resp_version == 3,
+                        meta.no_touch,
+                        meta.id,
+                    )
+                    .await
+                    .map_err(ConnectionControl::Continue)?;
+                    let Some(value) = parse_optional_bytes_response(&reply.response)
+                        .map_err(ConnectionControl::Continue)?
+                    else {
+                        continue;
+                    };
+                    if let Some(offset) = reply.replication_offset {
+                        meta.last_write_replication_offset = offset;
+                    }
+                    return Ok(Response::Array(Box::new(smallvec::smallvec![
+                        Response::Value(Some(SenkoValue::Raw(key_bytes))),
+                        Response::Value(Some(SenkoValue::Raw(Bytes::from(value)))),
+                    ])));
+                }
+            }
+            StoreBlockingOp::Move {
+                dest,
+                src_dir,
+                dst_dir,
+            } => {
+                let source = spec.keys.first().expect("blocking source key");
+                let command_args = [
+                    Frame::BulkString(source.as_bytes()),
+                    Frame::BulkString(dest.as_bytes()),
+                    Frame::BulkString(if *src_dir == BlockSpecDirection::Left {
+                        b"LEFT"
+                    } else {
+                        b"RIGHT"
+                    }),
+                    Frame::BulkString(if *dst_dir == BlockSpecDirection::Left {
+                        b"LEFT"
+                    } else {
+                        b"RIGHT"
+                    }),
+                ];
+                let (bytes, _, _, _) =
+                    dispatch_cross_shard_list_move(meta, b"LMOVE", &command_args, config).await?;
+                let response = parse_response(&bytes).map_err(ConnectionControl::Continue)?;
+                if !matches!(response, Response::Value(None)) {
+                    return Ok(response);
+                }
+            }
+            StoreBlockingOp::MoveDeprecated { dest } => {
+                let source = spec.keys.first().expect("blocking source key");
+                let command_args = [
+                    Frame::BulkString(source.as_bytes()),
+                    Frame::BulkString(dest.as_bytes()),
+                ];
+                let (bytes, _, _, _) =
+                    dispatch_cross_shard_list_move(meta, b"RPOPLPUSH", &command_args, config)
+                        .await?;
+                let response = parse_response(&bytes).map_err(ConnectionControl::Continue)?;
+                if !matches!(response, Response::Value(None)) {
+                    return Ok(response);
+                }
+            }
+            StoreBlockingOp::MPop { direction, count } => {
+                let side = if *direction == BlockSpecDirection::Left {
+                    b"LEFT".as_slice()
+                } else {
+                    b"RIGHT".as_slice()
+                };
+                for key in &spec.keys {
+                    let key_bytes = Bytes::copy_from_slice(key.as_bytes());
+                    let reply = server_info::execute_store_command_on_shard(
+                        shard_for_key(key.as_bytes(), config.num_shards),
+                        Bytes::copy_from_slice(b"LMPOP"),
+                        vec![
+                            Bytes::from_static(b"1"),
+                            key_bytes,
+                            Bytes::copy_from_slice(side),
+                            Bytes::from_static(b"COUNT"),
+                            Bytes::from(count.to_string()),
+                        ],
+                        meta.resp_version == 3,
+                        meta.no_touch,
+                        meta.id,
+                    )
+                    .await
+                    .map_err(ConnectionControl::Continue)?;
+                    if is_null_response(&reply.response).map_err(ConnectionControl::Continue)? {
+                        continue;
+                    }
+                    if let Some(offset) = reply.replication_offset {
+                        meta.last_write_replication_offset = offset;
+                    }
+                    return parse_response(&reply.response).map_err(ConnectionControl::Continue);
+                }
+            }
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Ok(match spec.timeout_response {
+                BlockingResponseKind::NullArray => Response::NullArray,
+                BlockingResponseKind::NullBulk => Response::Value(None),
+            });
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn poll_cross_shard_zset_block(
+    spec: ZBlockSpec,
+    config: &SenkoConfig,
+    meta: &mut ConnectionMeta,
+) -> Result<Response, ConnectionControl> {
+    let deadline = spec.timeout.map(|timeout| Instant::now() + timeout);
+    loop {
+        match spec.op {
+            StoreZBlockingOp::ZPop { direction } => {
+                let side = if direction == ZBlockSpecDirection::Min {
+                    b"MIN".as_slice()
+                } else {
+                    b"MAX".as_slice()
+                };
+                for key in &spec.keys {
+                    let reply = server_info::execute_store_command_on_shard(
+                        shard_for_key(key.as_bytes(), config.num_shards),
+                        Bytes::copy_from_slice(b"ZMPOP"),
+                        vec![
+                            Bytes::from_static(b"1"),
+                            Bytes::copy_from_slice(key.as_bytes()),
+                            Bytes::copy_from_slice(side),
+                            Bytes::from_static(b"COUNT"),
+                            Bytes::from_static(b"1"),
+                        ],
+                        meta.resp_version == 3,
+                        meta.no_touch,
+                        meta.id,
+                    )
+                    .await
+                    .map_err(ConnectionControl::Continue)?;
+                    if is_null_response(&reply.response).map_err(ConnectionControl::Continue)? {
+                        continue;
+                    }
+                    if let Some(offset) = reply.replication_offset {
+                        meta.last_write_replication_offset = offset;
+                    }
+                    let value =
+                        parse_response(&reply.response).map_err(ConnectionControl::Continue)?;
+                    return flatten_zmpop_single_response(value);
+                }
+            }
+            StoreZBlockingOp::ZMPop { direction, count } => {
+                let side = if direction == ZBlockSpecDirection::Min {
+                    b"MIN".as_slice()
+                } else {
+                    b"MAX".as_slice()
+                };
+                for key in &spec.keys {
+                    let reply = server_info::execute_store_command_on_shard(
+                        shard_for_key(key.as_bytes(), config.num_shards),
+                        Bytes::copy_from_slice(b"ZMPOP"),
+                        vec![
+                            Bytes::from_static(b"1"),
+                            Bytes::copy_from_slice(key.as_bytes()),
+                            Bytes::copy_from_slice(side),
+                            Bytes::from_static(b"COUNT"),
+                            Bytes::from(count.to_string()),
+                        ],
+                        meta.resp_version == 3,
+                        meta.no_touch,
+                        meta.id,
+                    )
+                    .await
+                    .map_err(ConnectionControl::Continue)?;
+                    if is_null_response(&reply.response).map_err(ConnectionControl::Continue)? {
+                        continue;
+                    }
+                    if let Some(offset) = reply.replication_offset {
+                        meta.last_write_replication_offset = offset;
+                    }
+                    return parse_response(&reply.response).map_err(ConnectionControl::Continue);
+                }
+            }
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Ok(match spec.timeout_response {
+                BlockingResponseKind::NullArray => Response::NullArray,
+                BlockingResponseKind::NullBulk => Response::Value(None),
+            });
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn poll_cross_shard_xread_block(
+    spec: XReadBlockSpec,
+    config: &SenkoConfig,
+    meta: &mut ConnectionMeta,
+) -> Result<Response, ConnectionControl> {
+    let deadline = spec.timeout.map(|timeout| Instant::now() + timeout);
+    let prefix = build_xread_prefix(spec.count);
+    loop {
+        let response = execute_grouped_stream_read_resolved(
+            meta,
+            b"XREAD",
+            &prefix,
+            &spec.streams,
+            config.num_shards,
+        )
+        .await?;
+        if !matches!(response, Response::Value(None)) {
+            return Ok(response);
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Ok(match spec.timeout_response {
+                BlockingResponseKind::NullArray => Response::NullArray,
+                BlockingResponseKind::NullBulk => Response::Value(None),
+            });
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn poll_cross_shard_xreadgroup_block(
+    spec: XReadGroupBlockSpec,
+    config: &SenkoConfig,
+    meta: &mut ConnectionMeta,
+) -> Result<Response, ConnectionControl> {
+    let deadline = spec.timeout.map(|timeout| Instant::now() + timeout);
+    let prefix = build_xreadgroup_prefix(&spec);
+    loop {
+        let response = execute_grouped_stream_read_resolved(
+            meta,
+            b"XREADGROUP",
+            &prefix,
+            &spec.streams,
+            config.num_shards,
+        )
+        .await?;
+        if !matches!(response, Response::Value(None)) {
+            return Ok(response);
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Ok(match spec.timeout_response {
+                BlockingResponseKind::NullArray => Response::NullArray,
+                BlockingResponseKind::NullBulk => Response::Value(None),
+            });
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn execute_grouped_xread(
+    meta: &mut ConnectionMeta,
+    args: &[Bytes],
+    num_shards: usize,
+) -> Result<Response, ConnectionControl> {
+    execute_grouped_stream_read(meta, b"XREAD", args, num_shards).await
+}
+
+async fn execute_grouped_xreadgroup(
+    meta: &mut ConnectionMeta,
+    args: &[Bytes],
+    num_shards: usize,
+) -> Result<Response, ConnectionControl> {
+    execute_grouped_stream_read(meta, b"XREADGROUP", args, num_shards).await
+}
+
+async fn execute_grouped_stream_read(
+    meta: &mut ConnectionMeta,
+    command: &[u8],
+    args: &[Bytes],
+    num_shards: usize,
+) -> Result<Response, ConnectionControl> {
+    let grouped = group_stream_read_args(args, num_shards)?;
+    execute_grouped_stream_read_requests(meta, command, grouped).await
+}
+
+async fn execute_grouped_stream_read_resolved(
+    meta: &mut ConnectionMeta,
+    command: &[u8],
+    prefix: &[Bytes],
+    streams: &[(CompactString, senko_core::StreamId)],
+    num_shards: usize,
+) -> Result<Response, ConnectionControl> {
+    let grouped = group_resolved_stream_read_args(prefix, streams, num_shards);
+    execute_grouped_stream_read_requests(meta, command, grouped).await
+}
+
+async fn execute_grouped_stream_read_requests(
+    meta: &mut ConnectionMeta,
+    command: &[u8],
+    grouped: Vec<GroupedStreamRead>,
+) -> Result<Response, ConnectionControl> {
+    let order = grouped
+        .iter()
+        .flat_map(|group| group.streams.iter().map(|(key, _)| key.clone()))
+        .collect::<Vec<_>>();
+    let mut responses = Vec::with_capacity(grouped.len());
+    let mut max_offset = None;
+    for group in grouped {
+        let reply = server_info::execute_store_command_on_shard(
+            group.shard_id,
+            Bytes::copy_from_slice(command),
+            group.args,
+            meta.resp_version == 3,
+            meta.no_touch,
+            meta.id,
+        )
+        .await
+        .map_err(ConnectionControl::Continue)?;
+        responses.push(parse_response(&reply.response).map_err(ConnectionControl::Continue)?);
+        max_offset = max_offset.max(reply.replication_offset);
+    }
+    if eq_ascii(command, b"XREADGROUP")
+        && let Some(offset) = max_offset
+    {
+        meta.last_write_replication_offset = offset;
+    }
+    merge_stream_read_responses(&order, responses)
+}
+
+fn build_xread_prefix(count: Option<usize>) -> Vec<Bytes> {
+    let mut prefix = Vec::new();
+    if let Some(count) = count {
+        prefix.push(Bytes::from_static(b"COUNT"));
+        prefix.push(Bytes::from(count.to_string()));
+    }
+    prefix
+}
+
+fn build_xreadgroup_prefix(spec: &XReadGroupBlockSpec) -> Vec<Bytes> {
+    let mut prefix = vec![
+        Bytes::from_static(b"GROUP"),
+        Bytes::copy_from_slice(spec.group.as_bytes()),
+        Bytes::copy_from_slice(spec.consumer.as_bytes()),
+    ];
+    if let Some(count) = spec.count {
+        prefix.push(Bytes::from_static(b"COUNT"));
+        prefix.push(Bytes::from(count.to_string()));
+    }
+    if spec.noack {
+        prefix.push(Bytes::from_static(b"NOACK"));
+    }
+    prefix
+}
+
+#[derive(Clone)]
+struct GroupedStreamRead {
+    shard_id: usize,
+    args: Vec<Bytes>,
+    streams: Vec<(Bytes, Bytes)>,
+}
+
+fn group_stream_read_args(
+    args: &[Bytes],
+    num_shards: usize,
+) -> Result<Vec<GroupedStreamRead>, ConnectionControl> {
+    let (prefix, streams) = split_stream_read_args(args)?;
+    Ok(group_resolved_stream_read_bytes(
+        prefix, streams, num_shards,
+    ))
+}
+
+fn group_resolved_stream_read_args(
+    prefix: &[Bytes],
+    streams: &[(CompactString, senko_core::StreamId)],
+    num_shards: usize,
+) -> Vec<GroupedStreamRead> {
+    let stream_bytes = streams
+        .iter()
+        .map(|(key, id)| {
+            let id = id.to_string();
+            (
+                Bytes::copy_from_slice(key.as_bytes()),
+                Bytes::copy_from_slice(id.as_bytes()),
+            )
+        })
+        .collect::<Vec<_>>();
+    group_resolved_stream_read_bytes(prefix.to_vec(), stream_bytes, num_shards)
+}
+
+fn group_resolved_stream_read_bytes(
+    prefix: Vec<Bytes>,
+    streams: Vec<(Bytes, Bytes)>,
+    num_shards: usize,
+) -> Vec<GroupedStreamRead> {
+    let mut grouped = std::collections::BTreeMap::<usize, Vec<(Bytes, Bytes)>>::new();
+    for (key, id) in streams {
+        grouped
+            .entry(shard_for_key(key.as_ref(), num_shards))
+            .or_default()
+            .push((key, id));
+    }
+    grouped
+        .into_iter()
+        .map(|(shard_id, streams)| {
+            let mut args = prefix.clone();
+            args.push(Bytes::from_static(b"STREAMS"));
+            args.extend(streams.iter().map(|(key, _)| key.clone()));
+            args.extend(streams.iter().map(|(_, id)| id.clone()));
+            GroupedStreamRead {
+                shard_id,
+                args,
+                streams,
+            }
+        })
+        .collect()
+}
+
+fn split_stream_read_args(
+    args: &[Bytes],
+) -> Result<(Vec<Bytes>, Vec<(Bytes, Bytes)>), ConnectionControl> {
+    let stream_index = args
+        .iter()
+        .position(|arg| arg.eq_ignore_ascii_case(b"STREAMS"))
+        .ok_or_else(|| ConnectionControl::Continue(error_message("ERR syntax error")))?;
+    let prefix = args[..stream_index].to_vec();
+    let remaining = &args[stream_index + 1..];
+    if remaining.len() < 2 || !remaining.len().is_multiple_of(2) {
+        return Err(ConnectionControl::Continue(error_message(
+            UNBALANCED_XREAD_ERROR,
+        )));
+    }
+    let half = remaining.len() / 2;
+    Ok((
+        prefix,
+        remaining[..half]
+            .iter()
+            .cloned()
+            .zip(remaining[half..].iter().cloned())
+            .collect(),
+    ))
+}
+
+fn merge_stream_read_responses(
+    order: &[Bytes],
+    responses: Vec<Response>,
+) -> Result<Response, ConnectionControl> {
+    let mut merged = HashMap::<Vec<u8>, Response, RandomState>::with_hasher(RandomState::default());
+    for response in responses {
+        match response {
+            Response::Value(None) | Response::NullArray => {}
+            Response::Array(items) => {
+                for item in items.into_vec() {
+                    let key = stream_response_key(&item)?.to_vec();
+                    merged.insert(key, item);
+                }
+            }
+            _ => {
+                return Err(ConnectionControl::Continue(error_message(
+                    "ERR shard coordination protocol error",
+                )));
+            }
+        }
+    }
+    let mut out = smallvec::SmallVec::<[Response; 16]>::new();
+    for key in order {
+        if let Some(item) = merged.remove(key.as_ref()) {
+            out.push(item);
+        }
+    }
+    if out.is_empty() {
+        Ok(Response::Value(None))
+    } else {
+        Ok(Response::Array(Box::new(out)))
+    }
+}
+
+fn stream_response_key(response: &Response) -> Result<&[u8], ConnectionControl> {
+    let Response::Array(items) = response else {
+        return Err(ConnectionControl::Continue(error_message(
+            "ERR shard coordination protocol error",
+        )));
+    };
+    let Some(Response::Value(Some(SenkoValue::Raw(key)))) = items.first() else {
+        return Err(ConnectionControl::Continue(error_message(
+            "ERR shard coordination protocol error",
+        )));
+    };
+    Ok(key.as_ref())
+}
+
+fn flatten_zmpop_single_response(response: Response) -> Result<Response, ConnectionControl> {
+    let Response::Array(items) = response else {
+        return Err(ConnectionControl::Continue(error_message(
+            "ERR shard coordination protocol error",
+        )));
+    };
+    if items.len() == 3 {
+        return Ok(Response::Array(items));
+    }
+    if items.len() != 2 {
+        return Err(ConnectionControl::Continue(error_message(
+            "ERR shard coordination protocol error",
+        )));
+    }
+    let key = items[0].clone();
+    let Response::Array(entries) = &items[1] else {
+        return Err(ConnectionControl::Continue(error_message(
+            "ERR shard coordination protocol error",
+        )));
+    };
+    let Some(Response::Array(entry)) = entries.first() else {
+        return Err(ConnectionControl::Continue(error_message(
+            "ERR shard coordination protocol error",
+        )));
+    };
+    if entry.len() != 2 {
+        return Err(ConnectionControl::Continue(error_message(
+            "ERR shard coordination protocol error",
+        )));
+    }
+    Ok(Response::Array(Box::new(smallvec::smallvec![
+        key,
+        entry[0].clone(),
+        entry[1].clone(),
+    ])))
+}
+
+fn strip_block_option(args: &[Frame<'_>]) -> Result<Vec<Bytes>, ConnectionControl> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut index = 0usize;
+    while index < args.len() {
+        let bytes = frame_bytes(&args[index])
+            .map(Bytes::copy_from_slice)
+            .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
+        if bytes.eq_ignore_ascii_case(b"BLOCK") {
+            index += 2;
+            continue;
+        }
+        out.push(bytes);
+        index += 1;
+    }
+    Ok(out)
+}
+
+fn collect_xread_keys(args: &[Frame<'_>]) -> Result<Vec<Bytes>, ConnectionControl> {
+    let mut index = 0usize;
+    while index < args.len() {
+        let token = frame_bytes(&args[index])
+            .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
+        if token.eq_ignore_ascii_case(b"COUNT") || token.eq_ignore_ascii_case(b"BLOCK") {
+            index += 2;
+            continue;
+        }
+        break;
+    }
+    collect_stream_keys_after_token(args, index)
+}
+
+fn collect_xreadgroup_keys(args: &[Frame<'_>]) -> Result<Vec<Bytes>, ConnectionControl> {
+    if args.len() < 4 {
+        return Err(ConnectionControl::Continue(error_message(
+            "ERR syntax error",
+        )));
+    }
+    let mut index = 3usize;
+    while index < args.len() {
+        let token = frame_bytes(&args[index])
+            .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
+        if token.eq_ignore_ascii_case(b"COUNT")
+            || token.eq_ignore_ascii_case(b"BLOCK")
+            || token.eq_ignore_ascii_case(b"CLAIM")
+        {
+            index += 2;
+            continue;
+        }
+        if token.eq_ignore_ascii_case(b"NOACK") {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    collect_stream_keys_after_token(args, index)
+}
+
+fn collect_stream_keys_after_token(
+    args: &[Frame<'_>],
+    token_index: usize,
+) -> Result<Vec<Bytes>, ConnectionControl> {
+    let token = args
+        .get(token_index)
+        .ok_or_else(|| ConnectionControl::Continue(error_message("ERR syntax error")))?;
+    let token =
+        frame_bytes(token).map_err(|error| ConnectionControl::Continue(error_bytes(&error)))?;
+    if !token.eq_ignore_ascii_case(b"STREAMS") {
+        return Err(ConnectionControl::Continue(error_message(
+            "ERR syntax error",
+        )));
+    }
+    let remaining = &args[token_index + 1..];
+    if remaining.len() < 2 || !remaining.len().is_multiple_of(2) {
+        return Err(ConnectionControl::Continue(error_message(
+            UNBALANCED_XREAD_ERROR,
+        )));
+    }
+    remaining[..remaining.len() / 2]
+        .iter()
+        .map(|frame| {
+            frame_bytes(frame)
+                .map(Bytes::copy_from_slice)
+                .map_err(|error| ConnectionControl::Continue(error_bytes(&error)))
+        })
+        .collect()
 }
 
 async fn dispatch_blocking_command(
     conn_id: u64,
     command: &[u8],
     args: &[Frame<'_>],
+    config: &SenkoConfig,
+    shard_id: usize,
     store: &Rc<RefCell<Store>>,
     blocked: &Rc<RefCell<BlockedKeyRegistry>>,
     watch_registry: &Rc<RefCell<WatchRegistry>>,
@@ -2270,6 +5453,13 @@ async fn dispatch_blocking_command(
     meta: &mut ConnectionMeta,
     state: &mut ConnectionState,
 ) -> Result<Option<Response>, ConnectionControl> {
+    if config.num_shards > 1
+        && let Some(response) =
+            dispatch_cross_shard_blocking_command(command, args, config, shard_id, meta).await?
+    {
+        return Ok(Some(response));
+    }
+
     let list_blocked_result = {
         let mut store_ref = store.borrow_mut();
         if eq_ascii(command, b"BLPOP") {
@@ -2509,7 +5699,7 @@ async fn await_pause(conn_id: u64, pause_state: &Rc<RefCell<PauseState>>) {
     .await
 }
 
-fn post_dispatch_notify(
+pub(crate) fn post_dispatch_notify(
     command: &[u8],
     args: &[Frame<'_>],
     response: &Response,
@@ -2587,7 +5777,7 @@ fn notify_keys_written(
     }
 }
 
-fn notification_keys(
+pub(crate) fn notification_keys(
     command: &[u8],
     args: &[Frame<'_>],
     response: &Response,

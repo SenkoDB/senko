@@ -348,6 +348,9 @@ fn client_kill(
             if maxage.is_none() {
                 return Err(error_message("ERR syntax error"));
             }
+            if maxage == Some(0) {
+                return Err(error_message("ERR maxage should be greater than 0"));
+            }
             index += 1;
             continue;
         }
@@ -582,7 +585,7 @@ fn client_tracking(
     }
     if bcast && (optin || optout) {
         return Err(error_message(
-            "ERR You can't use BCAST and OPTIN/OPTOUT at the same time",
+            "ERR OPTIN and OPTOUT are not compatible with BCAST",
         ));
     }
     meta.flags.insert(ConnectionFlags::TRACKING);

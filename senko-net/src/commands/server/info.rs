@@ -15,6 +15,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use compact_str::CompactString;
 use compio::runtime::spawn_blocking;
 use crossfire::compat::{BlockingRxTrait, MRx as Receiver, MTx as Sender, TryRecvError};
 use hashbrown::HashMap;
@@ -29,12 +30,14 @@ use smallvec::{SmallVec, smallvec};
 use crate::{
     blocked::BlockedKeyRegistry,
     commands::cluster::ClusterCommandState,
-    commands::connection::client_ops::{PauseMode, PauseState},
+    commands::connection::client_ops::{self, PauseMode, PauseState, TrackingRegistry},
+    commands::server::command_info,
     commands::server::config as live_config,
     connection::{
         ClientConnectionMap, bulk_string, error_bytes, error_message, frame_bytes,
         serialize_response,
     },
+    dispatch,
     pubsub::fanout::ShardFanOut,
     transaction::{ConnectionMap, WatchRegistry},
 };
@@ -80,6 +83,12 @@ pub struct ShardStats {
     pub connected_clients: AtomicU64,
     pub client_recent_max_input_buffer: AtomicU64,
     pub client_recent_max_output_buffer: AtomicU64,
+}
+
+#[derive(Debug)]
+pub(crate) struct RoutedStoreCommandReply {
+    pub response: Vec<u8>,
+    pub replication_offset: Option<u64>,
 }
 
 impl Default for ShardStats {
@@ -179,6 +188,14 @@ pub(crate) enum ShardQuery {
         channel: Bytes,
         payload: Bytes,
         reply: Sender<Result<u64, String>>,
+    },
+    ExecuteStoreCommand {
+        command: Bytes,
+        args: Vec<Bytes>,
+        resp3: bool,
+        no_touch: bool,
+        conn_id: u64,
+        reply: Sender<RoutedStoreCommandReply>,
     },
 }
 
@@ -483,6 +500,7 @@ pub(crate) fn drain_shard_queries(
     blocked: &Rc<RefCell<BlockedKeyRegistry>>,
     client_connections: &Rc<RefCell<ClientConnectionMap>>,
     pause_state: &Rc<RefCell<PauseState>>,
+    tracking_registry: &Rc<RefCell<TrackingRegistry>>,
     watch_registry: &Rc<RefCell<WatchRegistry>>,
     connections: &Rc<RefCell<ConnectionMap>>,
     shard_pubsub: &Rc<RefCell<ShardFanOut>>,
@@ -658,6 +676,120 @@ pub(crate) fn drain_shard_queries(
                     .borrow_mut()
                     .spublish_local(channel.as_ref(), payload);
                 let _ = reply.send(Ok(delivered));
+            }
+            ShardQuery::ExecuteStoreCommand {
+                command,
+                args,
+                resp3,
+                no_touch,
+                conn_id,
+                reply,
+            } => {
+                let frames = args
+                    .iter()
+                    .map(|arg| Frame::BulkString(arg.as_ref()))
+                    .collect::<Vec<_>>();
+                let is_write = command_info::is_write_command(command.as_ref());
+
+                let response = match crate::connection::dispatch_key_lifecycle_command(
+                    command.as_ref(),
+                    &frames,
+                    store,
+                    blocked,
+                    watch_registry,
+                    connections,
+                    resp3,
+                ) {
+                    Ok(Some(response)) => {
+                        if is_write {
+                            if let Ok(Some(keys)) =
+                                command_info::extract_command_keys(command.as_ref(), &frames)
+                            {
+                                let tracked_keys = keys
+                                    .into_iter()
+                                    .filter_map(|key| CompactString::from_utf8(key).ok())
+                                    .collect::<Vec<_>>();
+                                client_ops::invalidate_written_keys(
+                                    &tracked_keys,
+                                    conn_id,
+                                    tracking_registry,
+                                    client_connections,
+                                );
+                            }
+                        }
+                        RoutedStoreCommandReply {
+                            response,
+                            replication_offset: if is_write {
+                                crate::commands::server::replication::record_routed_write(
+                                    shard_id,
+                                    command.as_ref(),
+                                    &frames,
+                                )
+                            } else {
+                                None
+                            },
+                        }
+                    }
+                    Ok(None) => {
+                        let response = {
+                            let mut store_ref = store.borrow_mut();
+                            let restore_no_touch = store_ref.no_touch();
+                            store_ref.set_no_touch(no_touch);
+                            let response =
+                                dispatch::dispatch(&mut store_ref, command.as_ref(), &frames);
+                            if let Ok(response) = &response
+                                && is_write
+                            {
+                                crate::connection::post_dispatch_notify(
+                                    command.as_ref(),
+                                    &frames,
+                                    response,
+                                    &mut store_ref,
+                                    blocked,
+                                    watch_registry,
+                                    connections,
+                                );
+                                let keys = crate::connection::notification_keys(
+                                    command.as_ref(),
+                                    &frames,
+                                    response,
+                                );
+                                client_ops::invalidate_written_keys(
+                                    &keys,
+                                    conn_id,
+                                    tracking_registry,
+                                    client_connections,
+                                );
+                            }
+                            store_ref.set_no_touch(restore_no_touch);
+                            response
+                        };
+
+                        match response {
+                            Ok(response) => RoutedStoreCommandReply {
+                                response: serialize_response(&response, resp3),
+                                replication_offset: if is_write {
+                                    crate::commands::server::replication::record_routed_write(
+                                        shard_id,
+                                        command.as_ref(),
+                                        &frames,
+                                    )
+                                } else {
+                                    None
+                                },
+                            },
+                            Err(error) => RoutedStoreCommandReply {
+                                response: error_bytes(&error),
+                                replication_offset: None,
+                            },
+                        }
+                    }
+                    Err(response) => RoutedStoreCommandReply {
+                        response,
+                        replication_offset: None,
+                    },
+                };
+                let _ = reply.send(response);
             }
         }
     }
@@ -1322,6 +1454,40 @@ pub fn shard_pubsub_publish(
         })
         .map_err(|_| error_message("ERR shard coordination timeout"))?;
     wait_for_single_sync_reply(reply_rx)
+}
+
+pub(crate) async fn execute_store_command_on_shard(
+    shard_id: usize,
+    command: Bytes,
+    args: Vec<Bytes>,
+    resp3: bool,
+    no_touch: bool,
+    conn_id: u64,
+) -> Result<RoutedStoreCommandReply, Vec<u8>> {
+    let bus = query_bus();
+    let (reply_tx, reply_rx) = crossfire::compat::mpmc::bounded_blocking(1);
+    bus.sender(shard_id)
+        .send(ShardQuery::ExecuteStoreCommand {
+            command,
+            args,
+            resp3,
+            no_touch,
+            conn_id,
+            reply: reply_tx,
+        })
+        .map_err(|_| error_message("ERR shard coordination timeout"))?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match reply_rx.try_recv() {
+            Ok(reply) => return Ok(reply),
+            Err(TryRecvError::Empty) if std::time::Instant::now() < deadline => {
+                compio::time::sleep(Duration::from_millis(1)).await;
+            }
+            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => {
+                return Err(error_message("ERR shard coordination timeout"));
+            }
+        }
+    }
 }
 
 pub async fn save_rdb_snapshot(config: &SenkoConfig) -> Result<(), String> {

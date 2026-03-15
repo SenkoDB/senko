@@ -172,6 +172,227 @@ pub(crate) fn is_write_command(command: &[u8]) -> bool {
         .is_some_and(|meta| meta.flags.contains(&"write"))
 }
 
+pub(crate) fn extract_command_keys(
+    command: &[u8],
+    args: &[Frame<'_>],
+) -> Result<Option<Vec<Vec<u8>>>, Vec<u8>> {
+    let Ok(name) = std::str::from_utf8(command).map(str::to_ascii_lowercase) else {
+        return Ok(None);
+    };
+    if let Some(keys) = extract_explicit_command_keys(&name, args)? {
+        return Ok(Some(keys));
+    }
+    let Some(meta) = registry().lookup(&name) else {
+        return Ok(None);
+    };
+    if meta.key_specs.is_empty() {
+        return Ok(None);
+    }
+    let mut frames = Vec::with_capacity(args.len() + 1);
+    frames.push(Frame::BulkString(command));
+    frames.extend(args.iter().cloned());
+    extract_keys(meta, &frames).map(|pairs| Some(pairs.into_iter().map(|(key, _)| key).collect()))
+}
+
+fn extract_explicit_command_keys(
+    name: &str,
+    args: &[Frame<'_>],
+) -> Result<Option<Vec<Vec<u8>>>, Vec<u8>> {
+    match name {
+        "copy" | "rename" | "renamenx" | "lmove" | "rpoplpush" | "smove" | "zrangestore"
+        | "lcs" | "geosearchstore" => collect_key_indexes(args, &[0, 1]).map(Some),
+        "bitop" => collect_bitop_keys(args).map(Some),
+        "del" | "exists" | "touch" | "unlink" | "sdiff" | "sinter" | "sunion" => {
+            collect_all_keys(args).map(Some)
+        }
+        "pfadd" => collect_key_indexes(args, &[0]).map(Some),
+        "pfcount" | "pfmerge" => collect_all_keys(args).map(Some),
+        "sdiffstore" | "sinterstore" | "sunionstore" => collect_all_keys(args).map(Some),
+        "msetnx" => collect_every_other_keys(args, 0, 2).map(Some),
+        "msetex" => collect_numkeys_every_other_keys(args, 0, 1, 2).map(Some),
+        "sintercard" | "lmpop" | "zmpop" | "zdiff" | "zinter" | "zunion" | "zintercard" => {
+            collect_numkeys_keys(args, 0, 1).map(Some)
+        }
+        "zdiffstore" | "zinterstore" | "zunionstore" => {
+            let mut keys = collect_key_indexes(args, &[0])?;
+            keys.extend(collect_numkeys_keys(args, 1, 2)?);
+            Ok(Some(keys))
+        }
+        "dump"
+        | "linsert"
+        | "move"
+        | "restore"
+        | "sort"
+        | "sort_ro"
+        | "spop"
+        | "substr"
+        | "xack"
+        | "xackdel"
+        | "xadd"
+        | "xautoclaim"
+        | "xclaim"
+        | "xdel"
+        | "xdelex"
+        | "xlen"
+        | "xpending"
+        | "xrange"
+        | "xrevrange"
+        | "xsetid"
+        | "xtrim"
+        | "bitcount"
+        | "bitfield"
+        | "bitfield_ro"
+        | "bitpos"
+        | "getbit"
+        | "setbit"
+        | "geoadd"
+        | "geodist"
+        | "geohash"
+        | "geopos"
+        | "georadius_ro"
+        | "georadiusbymember_ro"
+        | "geosearch"
+        | "zpopmax"
+        | "zpopmin" => collect_key_indexes(args, &[0]).map(Some),
+        "georadius" | "georadiusbymember" => collect_georadius_keys(args).map(Some),
+        "object" | "xgroup" | "xinfo" => collect_key_indexes(args, &[1]).map(Some),
+        _ => Ok(None),
+    }
+}
+
+fn collect_bitop_keys(args: &[Frame<'_>]) -> Result<Vec<Vec<u8>>, Vec<u8>> {
+    if args.len() < 2 {
+        return Ok(Vec::new());
+    }
+    collect_key_indexes(args, &[1]).and_then(|mut keys| {
+        keys.extend(collect_key_range(args, 2..args.len())?);
+        Ok(keys)
+    })
+}
+
+fn collect_georadius_keys(args: &[Frame<'_>]) -> Result<Vec<Vec<u8>>, Vec<u8>> {
+    if args.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut keys = collect_key_indexes(args, &[0])?;
+    let mut index = 1usize;
+    while index < args.len() {
+        let token = frame_bytes(&args[index]).map_err(|error| error_bytes(&error))?;
+        if token.eq_ignore_ascii_case(b"STORE") || token.eq_ignore_ascii_case(b"STOREDIST") {
+            if let Some(frame) = args.get(index + 1) {
+                keys.push(
+                    frame_bytes(frame)
+                        .map_err(|error| error_bytes(&error))?
+                        .to_vec(),
+                );
+            }
+            break;
+        }
+        index += 1;
+    }
+    Ok(keys)
+}
+
+fn collect_key_indexes(args: &[Frame<'_>], indexes: &[usize]) -> Result<Vec<Vec<u8>>, Vec<u8>> {
+    indexes
+        .iter()
+        .filter_map(|index| args.get(*index))
+        .map(|frame| {
+            frame_bytes(frame)
+                .map_err(|error| error_bytes(&error))
+                .map(|key| key.to_vec())
+        })
+        .collect()
+}
+
+fn collect_key_range(
+    args: &[Frame<'_>],
+    range: std::ops::Range<usize>,
+) -> Result<Vec<Vec<u8>>, Vec<u8>> {
+    args[range]
+        .iter()
+        .map(|frame| {
+            frame_bytes(frame)
+                .map_err(|error| error_bytes(&error))
+                .map(|key| key.to_vec())
+        })
+        .collect()
+}
+
+fn collect_all_keys(args: &[Frame<'_>]) -> Result<Vec<Vec<u8>>, Vec<u8>> {
+    args.iter()
+        .map(|frame| {
+            frame_bytes(frame)
+                .map_err(|error| error_bytes(&error))
+                .map(|key| key.to_vec())
+        })
+        .collect()
+}
+
+fn collect_numkeys_keys(
+    args: &[Frame<'_>],
+    count_index: usize,
+    start_index: usize,
+) -> Result<Vec<Vec<u8>>, Vec<u8>> {
+    let Some(count_frame) = args.get(count_index) else {
+        return Ok(Vec::new());
+    };
+    let count = std::str::from_utf8(frame_bytes(count_frame).map_err(|error| error_bytes(&error))?)
+        .ok()
+        .and_then(|text| text.parse::<usize>().ok())
+        .ok_or_else(|| error_message("ERR Invalid numkeys specification"))?;
+    args.iter()
+        .skip(start_index)
+        .take(count)
+        .map(|frame| {
+            frame_bytes(frame)
+                .map_err(|error| error_bytes(&error))
+                .map(|key| key.to_vec())
+        })
+        .collect()
+}
+
+fn collect_numkeys_every_other_keys(
+    args: &[Frame<'_>],
+    count_index: usize,
+    start_index: usize,
+    step: usize,
+) -> Result<Vec<Vec<u8>>, Vec<u8>> {
+    let Some(count_frame) = args.get(count_index) else {
+        return Ok(Vec::new());
+    };
+    let count = std::str::from_utf8(frame_bytes(count_frame).map_err(|error| error_bytes(&error))?)
+        .ok()
+        .and_then(|text| text.parse::<usize>().ok())
+        .ok_or_else(|| error_message("ERR Invalid numkeys specification"))?;
+    args.iter()
+        .skip(start_index)
+        .step_by(step)
+        .take(count)
+        .map(|frame| {
+            frame_bytes(frame)
+                .map_err(|error| error_bytes(&error))
+                .map(|key| key.to_vec())
+        })
+        .collect()
+}
+
+fn collect_every_other_keys(
+    args: &[Frame<'_>],
+    start_index: usize,
+    step: usize,
+) -> Result<Vec<Vec<u8>>, Vec<u8>> {
+    args.iter()
+        .skip(start_index)
+        .step_by(step)
+        .map(|frame| {
+            frame_bytes(frame)
+                .map_err(|error| error_bytes(&error))
+                .map(|key| key.to_vec())
+        })
+        .collect()
+}
+
 fn command_monitor(
     args: &[Frame<'_>],
     meta: &mut ConnectionMeta,
@@ -493,7 +714,8 @@ fn extract_keys(
         match spec.extractor {
             KeyExtractor::Range { first, last, step } => {
                 let end = if last < 0 {
-                    args.len().saturating_sub(last.unsigned_abs())
+                    args.len()
+                        .saturating_sub(last.unsigned_abs().saturating_sub(1))
                 } else {
                     usize::min(last as usize + 1, args.len())
                 };
@@ -921,7 +1143,127 @@ fn command_metas() -> Vec<CommandMeta> {
         );
     }
 
+    for meta in &mut metas {
+        if !meta.key_specs.is_empty()
+            || meta.first_key != 1
+            || meta.last_key != 1
+            || meta.step != 1
+            || !supports_single_key_routing(meta.name)
+        {
+            continue;
+        }
+        let flags = if meta.flags.contains(&"readonly") {
+            &["read", "RO"]
+        } else {
+            &["write", "OW"]
+        };
+        meta.key_specs = Box::leak(vec![keys_range(1, 1, 1, flags)].into_boxed_slice());
+    }
+
     metas
+}
+
+fn supports_single_key_routing(name: &str) -> bool {
+    matches!(
+        name,
+        "append"
+            | "decr"
+            | "decrby"
+            | "exists"
+            | "expire"
+            | "expireat"
+            | "expiretime"
+            | "getdel"
+            | "getex"
+            | "getrange"
+            | "getset"
+            | "incr"
+            | "incrby"
+            | "incrbyfloat"
+            | "persist"
+            | "pexpire"
+            | "pexpireat"
+            | "pexpiretime"
+            | "psetex"
+            | "setex"
+            | "setnx"
+            | "setrange"
+            | "strlen"
+            | "ttl"
+            | "pttl"
+            | "type"
+            | "hdel"
+            | "hexists"
+            | "hexpire"
+            | "hexpireat"
+            | "hexpiretime"
+            | "hget"
+            | "hgetall"
+            | "hgetdel"
+            | "hgetex"
+            | "hincrby"
+            | "hincrbyfloat"
+            | "hkeys"
+            | "hlen"
+            | "hmget"
+            | "hmset"
+            | "hpersist"
+            | "hpexpire"
+            | "hpexpireat"
+            | "hpexpiretime"
+            | "hpttl"
+            | "hrandfield"
+            | "hscan"
+            | "hsetex"
+            | "hsetnx"
+            | "hstrlen"
+            | "httl"
+            | "hvals"
+            | "lindex"
+            | "llen"
+            | "lpop"
+            | "lpos"
+            | "lpush"
+            | "lpushx"
+            | "lrange"
+            | "lrem"
+            | "lset"
+            | "ltrim"
+            | "rpop"
+            | "rpush"
+            | "rpushx"
+            | "sadd"
+            | "scard"
+            | "sismember"
+            | "smembers"
+            | "smismember"
+            | "srandmember"
+            | "srem"
+            | "sscan"
+            | "zadd"
+            | "zcard"
+            | "zcount"
+            | "zincrby"
+            | "zlexcount"
+            | "zmscore"
+            | "zpopmax"
+            | "zpopmin"
+            | "zrandmember"
+            | "zrange"
+            | "zrangebylex"
+            | "zrangebyscore"
+            | "zrank"
+            | "zrem"
+            | "zremrangebylex"
+            | "zremrangebyrank"
+            | "zremrangebyscore"
+            | "zrevrange"
+            | "zrevrangebylex"
+            | "zrevrangebyscore"
+            | "zrevrank"
+            | "zscan"
+            | "zscore"
+    )
 }
 
 fn classify(
@@ -1251,6 +1593,99 @@ mod tests {
         let rendered = String::from_utf8_lossy(&eval.response);
         assert!(rendered.contains("k1"));
         assert!(rendered.contains("k2"));
+    }
+
+    #[test]
+    fn extract_command_keys_reports_single_and_multi_key_commands() {
+        init(&SenkoConfig::default());
+
+        let set = extract_command_keys(b"SET", &[bs(b"foo"), bs(b"bar")])
+            .unwrap()
+            .unwrap();
+        assert_eq!(set, vec![b"foo".to_vec()]);
+
+        let mset = extract_command_keys(b"MSET", &[bs(b"left"), bs(b"1"), bs(b"right"), bs(b"2")])
+            .unwrap()
+            .unwrap();
+        assert_eq!(mset, vec![b"left".to_vec(), b"right".to_vec()]);
+
+        let hget = extract_command_keys(b"HGET", &[bs(b"hash"), bs(b"field")])
+            .unwrap()
+            .unwrap();
+        assert_eq!(hget, vec![b"hash".to_vec()]);
+
+        let del = extract_command_keys(b"DEL", &[bs(b"a"), bs(b"b")])
+            .unwrap()
+            .unwrap();
+        assert_eq!(del, vec![b"a".to_vec(), b"b".to_vec()]);
+
+        let rename = extract_command_keys(b"RENAME", &[bs(b"src"), bs(b"dst")])
+            .unwrap()
+            .unwrap();
+        assert_eq!(rename, vec![b"src".to_vec(), b"dst".to_vec()]);
+
+        let xadd = extract_command_keys(
+            b"XADD",
+            &[bs(b"stream"), bs(b"*"), bs(b"field"), bs(b"value")],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(xadd, vec![b"stream".to_vec()]);
+
+        let xgroup = extract_command_keys(
+            b"XGROUP",
+            &[bs(b"CREATE"), bs(b"stream"), bs(b"group"), bs(b"0")],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(xgroup, vec![b"stream".to_vec()]);
+
+        let zinterstore = extract_command_keys(
+            b"ZINTERSTORE",
+            &[bs(b"out"), bs(b"2"), bs(b"z1"), bs(b"z2")],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            zinterstore,
+            vec![b"out".to_vec(), b"z1".to_vec(), b"z2".to_vec()]
+        );
+
+        let lmpop = extract_command_keys(
+            b"LMPOP",
+            &[bs(b"2"), bs(b"left"), bs(b"right"), bs(b"LEFT")],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(lmpop, vec![b"left".to_vec(), b"right".to_vec()]);
+
+        let msetnx = extract_command_keys(b"MSETNX", &[bs(b"a"), bs(b"1"), bs(b"b"), bs(b"2")])
+            .unwrap()
+            .unwrap();
+        assert_eq!(msetnx, vec![b"a".to_vec(), b"b".to_vec()]);
+
+        let msetex = extract_command_keys(
+            b"MSETEX",
+            &[
+                bs(b"2"),
+                bs(b"a"),
+                bs(b"1"),
+                bs(b"b"),
+                bs(b"2"),
+                bs(b"EX"),
+                bs(b"5"),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(msetex, vec![b"a".to_vec(), b"b".to_vec()]);
+
+        let substr = extract_command_keys(b"SUBSTR", &[bs(b"key"), bs(b"0"), bs(b"1")])
+            .unwrap()
+            .unwrap();
+        assert_eq!(substr, vec![b"key".to_vec()]);
+
+        assert!(extract_command_keys(b"PING", &[]).unwrap().is_none());
     }
 
     #[test]

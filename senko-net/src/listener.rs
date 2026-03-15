@@ -38,6 +38,7 @@ use crate::{
 };
 
 static CROSS_SHARD_BUS: OnceLock<Arc<CrossShardBus>> = OnceLock::new();
+static NEXT_CONNECTION_ID: OnceLock<AtomicU64> = OnceLock::new();
 
 #[derive(Debug)]
 pub struct PreparedListener {
@@ -134,6 +135,7 @@ pub async fn run_shard(
     let query_engine = Rc::clone(&engine);
     let query_connections = Rc::clone(&client_connections);
     let query_pause = Rc::clone(&pause_state);
+    let query_tracking_registry = Rc::clone(&tracking_registry);
     let query_watch_registry = Rc::clone(&watch_registry);
     let query_watch_connections = Rc::clone(&connections);
     let query_pubsub = Rc::clone(&shard_pubsub);
@@ -166,6 +168,7 @@ pub async fn run_shard(
                 &query_blocked,
                 &query_connections,
                 &query_pause,
+                &query_tracking_registry,
                 &query_watch_registry,
                 &query_watch_connections,
                 &query_pubsub,
@@ -173,8 +176,6 @@ pub async fn run_shard(
         }
     })
     .detach();
-    let next_conn_id = AtomicU64::new(1);
-
     loop {
         while tasks.len() >= per_shard_limit {
             if let Some(result) = tasks.next().await {
@@ -193,7 +194,7 @@ pub async fn run_shard(
         server_info::on_connection_open(shard_index);
         let connection = Connection::new(
             shard_index,
-            next_conn_id.fetch_add(1, Ordering::Relaxed),
+            next_connection_id().fetch_add(1, Ordering::Relaxed),
             stream,
             peer_addr,
             local_addr,
@@ -228,4 +229,8 @@ fn bind_std_listener(addr: SocketAddr, config: &SenkoConfig) -> SenkoResult<StdT
     socket.listen(config.tcp_backlog as i32)?;
     socket.set_nonblocking(true)?;
     Ok(socket.into())
+}
+
+fn next_connection_id() -> &'static AtomicU64 {
+    NEXT_CONNECTION_ID.get_or_init(|| AtomicU64::new(1))
 }
